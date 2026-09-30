@@ -18,7 +18,7 @@
       "database_name": "collab-db",
       // Replace with the id printed by `npx wrangler d1 create collab-db`.
       // Any value works for local development.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "4063807c-d8e6-439f-b049-8fc594d3ea4f",
       "migrations_dir": "migrations"
     }
   ],
