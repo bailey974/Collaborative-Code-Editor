@@ -119,6 +119,10 @@ type CollabContextValue = {
   setHidePatterns: (patterns: string[]) => void;
   setExcludePatterns: (patterns: string[]) => void;
 
+  // Google Drive folder linked to this room (host-only; stored in room:meta).
+  driveFolder: { id: string; name: string } | null;
+  setDriveFolder: (folder: { id: string; name: string } | null) => void;
+
   grantDocPermission: (path: string, userId: string, level: DocPermissionLevel) => void;
 
   // request-to-edit
@@ -318,6 +322,7 @@ export function CollabProvider({
   // Reactive snapshots from Yjs
   const [rolesSnap, setRolesSnap] = useState<Record<string, RoomRole>>({});
   const [hostId, setHostId] = useState<string | null>(null);
+  const [driveFolderSnap, setDriveFolderSnap] = useState<{ id: string; name: string } | null>(null);
 
   const [visibilitySnap, setVisibilitySnap] = useState<VisibilityPolicy>({
     shareTreeEnabled: false,
@@ -429,6 +434,9 @@ export function CollabProvider({
     const updateHost = () => {
       setHostId(String(roomMeta.get("hostId") ?? "") || null);
       setDefaultRoleSnap(roomMeta.get("defaultRole") === "editor" ? "editor" : "viewer");
+      const dfId = String(roomMeta.get("driveFolderId") ?? "");
+      const dfName = String(roomMeta.get("driveFolderName") ?? "");
+      setDriveFolderSnap(dfId ? { id: dfId, name: dfName || dfId } : null);
     };
 
     const updateRoles = () => {
@@ -728,6 +736,19 @@ export function CollabProvider({
       });
     };
 
+    const setDriveFolder = (folder: { id: string; name: string } | null) => {
+      if (!isHost) return;
+      session.doc.transact(() => {
+        if (folder && folder.id) {
+          roomMeta.set("driveFolderId", folder.id);
+          roomMeta.set("driveFolderName", folder.name || folder.id);
+        } else {
+          roomMeta.delete("driveFolderId");
+          roomMeta.delete("driveFolderName");
+        }
+      });
+    };
+
     const grantDocPermission = (path: string, userId: string, level: DocPermissionLevel) => {
       if (!isHost) return;
       const key = normalizePath(path);
@@ -848,6 +869,9 @@ export function CollabProvider({
       setHidePatterns,
       setExcludePatterns,
 
+      driveFolder: driveFolderSnap,
+      setDriveFolder,
+
       grantDocPermission,
 
       editRequests: editRequestsSnap,
@@ -879,6 +903,7 @@ export function CollabProvider({
     editRequestsSnap,
     terminalRequestsSnap,
     defaultRole,
+    driveFolderSnap,
   ]);
 
   if (fatalError) {
