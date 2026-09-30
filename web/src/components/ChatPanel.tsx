@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useCollab } from "../collab/CollabProvider";
 
 type ChatMessage = {
@@ -9,14 +9,9 @@ type ChatMessage = {
   createdAt: number;
 };
 
+// Messages are appended by the Room server (see sendChat), which trims the
+// history to the last 500 and stamps the verified sender.
 const Y_CHAT = "chat:messages";
-const MAX_MESSAGES = 500;
-
-function makeId() {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? (crypto as any).randomUUID()
-    : `msg-${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`;
-}
 
 function formatTime(ts: number) {
   try {
@@ -27,7 +22,7 @@ function formatTime(ts: number) {
 }
 
 export default function ChatPanel() {
-  const { doc, me } = useCollab();
+  const { doc, me, sendChat, status } = useCollab();
 
   const yMessages = useMemo(() => doc.getArray<ChatMessage>(Y_CHAT), [doc]);
 
@@ -45,14 +40,6 @@ export default function ChatPanel() {
         .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
 
       setMessages(arr);
-
-      // Keep bounded size
-      if (arr.length > MAX_MESSAGES) {
-        const overflow = arr.length - MAX_MESSAGES;
-        doc.transact(() => {
-          yMessages.delete(0, overflow);
-        });
-      }
     };
 
     update();
@@ -85,18 +72,9 @@ export default function ChatPanel() {
     const t = input.trim();
     if (!t) return;
 
-    const msg: ChatMessage = {
-      id: makeId(),
-      userId: me.userId,
-      name: me.name,
-      text: t,
-      createdAt: Date.now(),
-    };
+    if (status !== "connected") return;
 
-    doc.transact(() => {
-      yMessages.push([msg]);
-    });
-
+    sendChat(t);
     setInput("");
   }
 

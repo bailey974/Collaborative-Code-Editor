@@ -5,14 +5,11 @@ import type * as monaco from "monaco-editor";
 import { MonacoBinding } from "y-monaco";
 
 import { useCollab } from "../collab/CollabProvider";
-import { getOrCreateYText, normalizePath } from "../collab/yFiles";
+import { getFilesMap, normalizePath } from "../collab/yFiles";
+import { isRunnable, requestRun } from "../runner/runEvents";
 
 type Props = {
   filePath?: string | null;
-
-  // content coming from your backend (/fs/read)
-  // used to seed shared Y.Text when it's empty, so you do NOT rely on Tauri local FS permissions.
-  initialContent?: string;
 };
 
 function inferLanguage(filePath?: string | null): string {
@@ -25,6 +22,7 @@ function inferLanguage(filePath?: string | null): string {
       return "typescript";
     case "js":
     case "jsx":
+    case "mjs":
       return "javascript";
     case "json":
       return "json";
@@ -316,7 +314,7 @@ function MenuBar(props: {
       {menuWrap(
         "Help",
         <>
-          {item("Shortcuts: Ctrl+S (download), Ctrl+Shift+P, Ctrl+F, Ctrl+G", () => { }, { disabled: false })}
+          {item("Shortcuts: Ctrl+S (download), Ctrl+Enter (run), Ctrl+Shift+P, Ctrl+F, Ctrl+G", () => { }, { disabled: false })}
           {item("Tip: Editing is CRDT-synced; presence is ephemeral.", () => { }, { disabled: false })}
         </>
       )}
@@ -324,7 +322,7 @@ function MenuBar(props: {
   );
 }
 
-export default function CodeEditor({ filePath, initialContent }: Props) {
+export default function CodeEditor({ filePath }: Props) {
   const {
     doc,
     awareness,
@@ -337,11 +335,11 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
     isHost,
   } = useCollab();
 
-  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Guard against out-of-order async work
-  const loadSeq = useRef(0);
+  // Monaco commands are registered once on mount; read the current file via a ref.
+  const filePathRef = useRef(filePath);
+  filePathRef.current = filePath;
 
   // Monaco refs
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -419,9 +417,9 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
   };
 
   const onDownload = () => {
-    if (!filePath) return;
-    const content = getCurrentValue();
-    downloadTextFile(basename(filePath), content);
+    const p = filePathRef.current;
+    if (!p) return;
+    downloadTextFile(basename(p), getCurrentValue());
   };
 
   const onCopyPath = () => {
@@ -430,45 +428,8 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
   };
 
   const onRunCode = () => {
-    if (!filePath) return;
-    const lower = filePath.toLowerCase();
-    const ext = lower.split(".").pop() ?? "";
-
-    let cmd = "";
-    switch (ext) {
-      case "py":
-        cmd = `python "${filePath}"`;
-        break;
-      case "js":
-        cmd = `node "${filePath}"`;
-        break;
-      case "ts":
-      case "tsx":
-        cmd = `npx tsx "${filePath}"`;
-        break;
-      case "java":
-        cmd = `java "${filePath}"`;
-        break;
-      case "c":
-      case "cpp":
-        // Windows fallback style basic compilation
-        cmd = `gcc "${filePath}" -o out && ./out`;
-        break;
-      case "go":
-        cmd = `go run "${filePath}"`;
-        break;
-      case "rs":
-        cmd = `cargo run`;
-        break;
-      default:
-        alert(`No default run command configured for .${ext} files.`);
-        return;
-    }
-
-    // Dispatch an event to send to TerminalPanel
-    window.dispatchEvent(
-      new CustomEvent("terminal-run-command", { detail: { command: cmd } })
-    );
+    const p = filePathRef.current;
+    if (p && isRunnable(p)) requestRun(p);
   };
 
   const applyViewOptions = () => {
@@ -520,61 +481,11 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
     editor.updateOptions({ readOnly: !canEdit });
   }, [filePath, language, canView, canEdit]);
 
-  // Seed the shared Y.Text from initialContent (ONLY if it’s empty)
   useEffect(() => {
-    const seq = ++loadSeq.current;
-
-    async function seedFromInitialContent() {
-      if (!filePath) {
-        setErr(null);
-        setLoading(false);
-        return;
-      }
-
-      if (!canView) {
-        setErr(accessReason ? accessMessage(accessReason) : "No permission to view this file.");
-        setLoading(false);
-        return;
-      }
-
-      const yText = getOrCreateYText(doc, filePath);
-
-      // If room already has content, do NOT overwrite it.
-      if (yText.length > 0) {
-        setErr(null);
-        setLoading(false);
-        return;
-      }
-
-      const seed = (initialContent ?? "").toString();
-      if (!seed) {
-        setErr(null);
-        setLoading(false);
-        return;
-      }
-
-      setLoading(true);
-      setErr(null);
-
-      try {
-        if (loadSeq.current !== seq) return;
-
-        if (yText.length === 0) {
-          doc.transact(() => {
-            yText.insert(0, seed);
-          });
-        }
-      } catch (e: any) {
-        if (loadSeq.current === seq) {
-          setErr(e?.message ?? String(e));
-        }
-      } finally {
-        if (loadSeq.current === seq) setLoading(false);
-      }
-    }
-
-    void seedFromInitialContent();
-  }, [doc, filePath, initialContent, canView, accessReason]);
+    if (!filePath) setErr(null);
+    else if (!canView) setErr(accessReason ? accessMessage(accessReason) : "No permission to view this file.");
+    else setErr(null);
+  }, [filePath, canView, accessReason]);
 
   // Bind Monaco model <-> Y.Text and re-bind when Monaco swaps models
   useEffect(() => {
@@ -596,7 +507,12 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
       // presence: show what file I'm on
       (awareness as any).setLocalStateField("activeFile", normalizePath(filePath));
 
-      const yText = getOrCreateYText(doc, filePath);
+      // Never create files from the editor: a missing entry means it was deleted.
+      const yText = getFilesMap(doc).get(normalizePath(filePath));
+      if (!yText) {
+        setErr("This file no longer exists.");
+        return;
+      }
 
       // MonacoBinding still applies remote updates even if editor is readOnly.
       editor.updateOptions({ readOnly: !canEdit });
@@ -619,7 +535,7 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
 
   const headerRight = (
     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-      {filePath && canEdit && (
+      {filePath && canView && isRunnable(filePath) && (
         <button
           onClick={onRunCode}
           style={{
@@ -635,7 +551,7 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
             alignItems: "center",
             gap: 6,
           }}
-          title="Run active file in terminal"
+          title="Run this file in your browser; output is shared with the room"
         >
           <span style={{ fontSize: 10 }}>▶</span> Run
         </button>
@@ -740,7 +656,6 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
           {filePath ?? "No file selected"}
         </div>
 
-        {loading && <div style={{ fontSize: 12, color: "#6b7280" }}>Loading…</div>}
         {err && (
           <div
             style={{
@@ -798,6 +713,9 @@ export default function CodeEditor({ filePath, initialContent }: Props) {
                 editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.KeyS, () => {
                   // download is allowed even when read-only
                   onDownload();
+                });
+                editor.addCommand(m.KeyMod.CtrlCmd | m.KeyCode.Enter, () => {
+                  onRunCode();
                 });
                 editor.addCommand(m.KeyMod.CtrlCmd | m.KeyMod.Shift | m.KeyCode.KeyP, () => {
                   run("editor.action.quickCommand");

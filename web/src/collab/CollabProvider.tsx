@@ -7,7 +7,7 @@ import React, {
   useState,
 } from "react";
 import * as Y from "yjs";
-import { WebsocketProvider } from "y-websocket";
+import YProvider from "y-partyserver/provider";
 import { attachPresenceStyles } from "./presenceStyles";
 
 /**
@@ -17,7 +17,12 @@ import { attachPresenceStyles } from "./presenceStyles";
  * - room roles (RBAC-ish: host/editor/viewer)
  * - file-tree visibility policy (share roots + hide/exclude rules)
  * - per-document permissions + request-to-edit workflow
- * - optional shared terminal (host-controlled)
+ * - shared run output (host-controlled)
+ *
+ * The Room Durable Object (server/src/room.ts) is authoritative: it assigns
+ * the host from the room's creator, makes viewers read-only, and reverts
+ * changes to room settings made by anyone but the host. The checks here are
+ * for UX only.
  */
 
 type Status = "connecting" | "connected" | "disconnected";
@@ -59,10 +64,17 @@ export type TerminalPolicy = {
   controllerUserId: string | null; // null => host only, "*" => any guest
 };
 
+export type RoomInfo = {
+  id: string;
+  name: string;
+  joinCode: string;
+  maxUsers: number;
+};
+
 type Session = {
   doc: Y.Doc;
-  provider: WebsocketProvider;
-  awareness: WebsocketProvider["awareness"];
+  provider: YProvider;
+  awareness: YProvider["awareness"];
 };
 
 type PathAccess =
@@ -70,15 +82,17 @@ type PathAccess =
   | { ok: false; reason: "tree_not_shared" | "outside_shared_roots" | "hidden" | "excluded" };
 
 type CollabContextValue = {
-  wsUrl: string;
+  room: RoomInfo;
   roomId: string;
-  setRoomId: (id: string) => void;
 
   // Yjs
   doc: Session["doc"];
   awareness: Session["awareness"];
   status: Status;
   lastError: string | null;
+  synced: boolean;
+
+  sendChat: (text: string) => void;
 
   // identity + roles
   me: Me;
@@ -96,6 +110,8 @@ type CollabContextValue = {
   canEditDoc: (path: string) => boolean;
 
   // host controls
+  defaultRole: "viewer" | "editor";
+  setDefaultRole: (role: "viewer" | "editor") => void;
   setMemberRole: (userId: string, role: Exclude<RoomRole, "host"> | "viewer" | "editor") => void;
 
   setShareTreeEnabled: (enabled: boolean) => void;
@@ -176,29 +192,31 @@ function normalizePath(p: string) {
   return (p ?? "").replace(/\\/g, "/").replace(/\/+/g, "/");
 }
 
-function resolveWsBaseUrl(explicit?: string) {
-  const env = (import.meta as any)?.env?.VITE_COLLAB_WS_URL;
-  let raw = String(explicit ?? env ?? "ws://localhost:1234").trim();
-
-  // Strip accidental wrapping quotes that break WebSocket URLs on Windows/.env.
-  raw = raw.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1").trim();
-
-  // Allow users to paste Render HTTPS URLs; convert to ws/wss.
-  if (raw.startsWith("https://")) raw = "wss://" + raw.slice("https://".length);
-  else if (raw.startsWith("http://")) raw = "ws://" + raw.slice("http://".length);
-
-  // y-websocket expects a base URL; room is appended by the client provider.
-  // If a path was accidentally included, drop it.
-  try {
-    const u = new URL(raw);
-    raw = u.origin; // keeps ws/wss scheme
-  } catch {
-    // keep as-is
+/**
+ * Collaboration server host + protocol. Defaults to the page's own origin
+ * (production serves the app and the Worker together; `vite dev` proxies
+ * /parties). Set VITE_COLLAB_URL to point at a different Worker.
+ */
+function resolveCollabServer() {
+  const raw = String(import.meta.env.VITE_COLLAB_URL ?? "").trim();
+  if (raw) {
+    try {
+      const u = new URL(raw);
+      const secure = u.protocol === "https:" || u.protocol === "wss:";
+      return { host: u.host, protocol: secure ? ("wss" as const) : ("ws" as const) };
+    } catch {
+      // fall through to same-origin
+    }
   }
-
-  raw = raw.replace(/\/+$/, "");
-  return raw;
+  const secure = window.location.protocol === "https:";
+  return { host: window.location.host, protocol: secure ? ("wss" as const) : ("ws" as const) };
 }
+
+/** Close reasons sent by the Room Durable Object that retrying won't fix. */
+const FATAL_CLOSE_REASONS: Record<string, string> = {
+  "room-full": "This room already has the maximum number of people connected.",
+  unauthorized: "Your session is not authorised for this room. Try signing in again.",
+};
 
 function globToRegExp(pattern: string) {
   // Very small glob: * => any chars, ? => single char
@@ -271,30 +289,31 @@ const Y_TERM_REQUESTS = "terminal:requests"; // array<{id,userId,name,createdAt}
 
 export function CollabProvider({
   children,
-  defaultRoomId = "default-room",
-  wsUrl,
+  room,
   displayName = "Anonymous",
   userId,
   token,
+  onLeave,
 }: {
   children: React.ReactNode;
-  defaultRoomId?: string;
-  wsUrl?: string;
+  room: RoomInfo;
   displayName?: string;
-  userId?: string | number;
-
-  /**
-   * Access token (e.g., your Django SimpleJWT access token).
-   * NOTE: This provider currently uses `y-websocket` (no built-in auth), so this is unused.
-   * If you switch back to a Hocuspocus server/provider, you can use this for onAuthenticate.
-   */
-  token?: string | (() => string | Promise<string>);
+  userId: string | number;
+  /** JWT from /api/auth; the Worker checks it and room membership on connect. */
+  token: string;
+  /** Called when the user dismisses a fatal connection error. */
+  onLeave?: () => void;
 }) {
-  const [roomId, setRoomId] = useState(defaultRoomId);
+  const roomId = room.id;
   const [session, setSession] = useState<Session | null>(null);
 
   const [status, setStatus] = useState<Status>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
+  const [fatalError, setFatalError] = useState<string | null>(null);
+  const [synced, setSynced] = useState(false);
+  // Bumped on awareness changes so the member list stays live.
+  const [awarenessTick, setAwarenessTick] = useState(0);
+  const [defaultRole, setDefaultRoleSnap] = useState<"viewer" | "editor">("viewer");
 
   // Reactive snapshots from Yjs
   const [rolesSnap, setRolesSnap] = useState<Record<string, RoomRole>>({});
@@ -309,7 +328,7 @@ export function CollabProvider({
 
   const [terminalPolicySnap, setTerminalPolicySnap] = useState<TerminalPolicy>({
     shared: false,
-    allowGuestInput: false,
+    allowGuestInput: true,
     controllerUserId: null,
   });
 
@@ -325,7 +344,7 @@ export function CollabProvider({
     color: randomColor(),
   });
 
-  const resolvedWsUrl = useMemo(() => resolveWsBaseUrl(wsUrl), [wsUrl]);
+  const server = useMemo(() => resolveCollabServer(), []);
 
   // Keep name fresh (user might login after first render)
   useEffect(() => {
@@ -341,19 +360,14 @@ export function CollabProvider({
     let alive = true;
 
     const doc = new Y.Doc();
-    // NOTE:
-    // This client is configured to work with the `y-websocket` server (e.g. `npx y-websocket --port 1234`).
-    // If you are running a Hocuspocus server instead, swap this back to HocuspocusProvider.
-    const provider = new WebsocketProvider(resolvedWsUrl, roomId, doc, {
+    const provider = new YProvider(server.host, roomId, doc, {
+      party: "room",
+      protocol: server.protocol,
+      params: { token },
       connect: true,
-    } as any);
+    });
 
     const awareness = provider.awareness;
-    const envRaw = (import.meta as any)?.env?.VITE_COLLAB_WS_URL;
-    const attemptedUrl = `${resolvedWsUrl}/${encodeURIComponent(roomId)}`;
-    // eslint-disable-next-line no-console
-    console.log("[collab] ws connect", { wsBase: resolvedWsUrl, roomId, attemptedUrl, env: envRaw });
-
 
     // Presence
     awareness.setLocalStateField("user", {
@@ -362,7 +376,12 @@ export function CollabProvider({
       color: meRef.current.color,
     });
 
-    const detachStyles = attachPresenceStyles(awareness as any);
+    const detachStyles = attachPresenceStyles(awareness);
+
+    const onAwareness = () => {
+      if (alive) setAwarenessTick((t) => t + 1);
+    };
+    awareness.on("change", onAwareness);
 
     const onStatus = (ev: any) => {
       if (!alive) return;
@@ -370,66 +389,33 @@ export function CollabProvider({
       setStatus(next);
       if (next === "connected") setLastError(null);
     };
-
     provider.on("status", onStatus);
 
-    // Some builds of y-websocket provider emit these events (safe even if unused).
-    const onConnError = (e: any) => {
+    const onSync = (isSynced: boolean) => {
+      if (alive) setSynced(!!isSynced);
+    };
+    provider.on("sync", onSync);
+
+    const onConnError = () => {
       if (!alive) return;
-      setLastError(
-        (prev) =>
-          prev ??
-          `WebSocket error\nURL: ${attemptedUrl}\nVITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
-      );
+      setLastError("Can't reach the collaboration server. Retrying…");
     };
     const onConnClose = (e: any) => {
       if (!alive) return;
-      const reason = stringifyReason(e);
+      const reason = typeof e?.reason === "string" ? e.reason : "";
+      if (FATAL_CLOSE_REASONS[reason]) {
+        setFatalError(FATAL_CLOSE_REASONS[reason]);
+        provider.disconnect();
+        return;
+      }
       setStatus("disconnected");
-      setLastError(
-        (prev) =>
-          prev ??
-          `${reason}\nURL: ${attemptedUrl}\nVITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
-      );
+      setLastError(`Connection lost (${stringifyReason(e)}). Reconnecting…`);
     };
     provider.on("connection-error", onConnError);
     provider.on("connection-close", onConnClose);
 
-    // Capture close codes/reasons from the underlying WebSocket when available.
-    // (Browsers may report code 1005 when the peer closes without a close frame.)
-    let wsCloseHandler: any = null;
-    let wsErrorHandler: any = null;
-    const attachWsListeners = () => {
-      const ws = (provider as any)?.ws;
-      if (!ws || wsCloseHandler) return;
-      wsCloseHandler = (e: any) => {
-        if (!alive) return;
-        setStatus("disconnected");
-        const reason = stringifyReason(e);
-        setLastError(
-          (prev) =>
-            prev ??
-            `${reason}
-URL: ${attemptedUrl}
-VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
-        );
-      };
-      wsErrorHandler = (e: any) => {
-        if (!alive) return;
-        setLastError(
-          (prev) =>
-            prev ??
-            `WebSocket error
-URL: ${attemptedUrl}
-VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
-        );
-      };
-      ws.addEventListener?.("close", wsCloseHandler);
-      ws.addEventListener?.("error", wsErrorHandler);
-    };
-    attachWsListeners();
-
-    // Initialize shared structures (do not overwrite if already present)
+    // Shared structures. Defaults are read with fallbacks rather than written
+    // here: the server owns room settings and would revert our writes.
     const roomMeta = doc.getMap<any>(Y_ROOM_META);
     const roles = doc.getMap<any>(Y_ROLES);
     const vis = doc.getMap<any>(Y_VIS);
@@ -439,35 +425,11 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
 
     const termPolicy = doc.getMap<any>(Y_TERM_POLICY);
 
-    doc.transact(() => {
-      if (vis.get("shareTreeEnabled") == null) vis.set("shareTreeEnabled", false);
-
-      if (termPolicy.get("shared") == null) termPolicy.set("shared", false);
-      if (termPolicy.get("allowGuestInput") == null) termPolicy.set("allowGuestInput", false);
-      if (termPolicy.get("controllerUserId") == null) termPolicy.set("controllerUserId", null);
-
-      // Ensure our user has at least a role entry once host exists.
-      // (We will also compute host based on roomMeta.hostId.)
-      if (!roles.get(meRef.current.userId)) {
-        // default: viewer until host grants editor
-        roles.set(meRef.current.userId, "viewer");
-      }
-    });
-
-    // Try to claim host if none exists (best-effort; backend should enforce in production)
-    const tryClaimHost = () => {
-      if (!alive) return;
-      doc.transact(() => {
-        const current = roomMeta.get("hostId");
-        if (!current) {
-          roomMeta.set("hostId", meRef.current.userId);
-          roles.set(meRef.current.userId, "host");
-        }
-      });
-    };
-
     // Observe Yjs for snapshots
-    const updateHost = () => setHostId(String(roomMeta.get("hostId") ?? "") || null);
+    const updateHost = () => {
+      setHostId(String(roomMeta.get("hostId") ?? "") || null);
+      setDefaultRoleSnap(roomMeta.get("defaultRole") === "editor" ? "editor" : "viewer");
+    };
 
     const updateRoles = () => {
       const out: Record<string, RoomRole> = {};
@@ -491,7 +453,8 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
     const updateTerminalPolicy = () => {
       const snap: TerminalPolicy = {
         shared: !!termPolicy.get("shared"),
-        allowGuestInput: !!termPolicy.get("allowGuestInput"),
+        // Default on: editors may run code unless the host turns it off.
+        allowGuestInput: termPolicy.get("allowGuestInput") !== false,
         controllerUserId: (termPolicy.get("controllerUserId") as any) ?? null,
       };
       setTerminalPolicySnap(snap);
@@ -537,32 +500,20 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
     editReqArr.observe(updateEditRequests);
     termReqArr.observe(updateTerminalRequests);
 
-    // When we become connected, attempt host claim if needed.
-    const statusWatcher = (ev: any) => {
-      const next = normalizeStatus(ev?.status);
-      if (next === "connected") {
-        attachWsListeners();
-        tryClaimHost();
-      }
-    };
-    provider.on("status", statusWatcher);
-
     setSession({ doc, provider, awareness });
     setStatus("connecting");
     setLastError(null);
+    setFatalError(null);
+    setSynced(false);
 
     return () => {
       alive = false;
 
       provider.off("status", onStatus);
-      provider.off("status", statusWatcher);
+      provider.off("sync", onSync);
+      awareness.off("change", onAwareness);
       provider.off("connection-error", onConnError);
       provider.off("connection-close", onConnClose);
-
-      // best-effort detach underlying ws listeners
-      const ws = (provider as any)?.ws;
-      if (ws && wsCloseHandler) ws.removeEventListener?.("close", wsCloseHandler);
-      if (ws && wsErrorHandler) ws.removeEventListener?.("error", wsErrorHandler);
 
       roomMeta.unobserve(updateHost);
       roles.unobserve(updateRoles);
@@ -581,7 +532,7 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       doc.destroy();
       setSession(null);
     };
-  }, [resolvedWsUrl, roomId, token]);
+  }, [server, roomId, token]);
 
   const me = meRef.current;
   const isHost = hostId === me.userId;
@@ -638,7 +589,8 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       return a.name.localeCompare(b.name);
     });
     return out;
-  }, [session, rolesSnap, hostId, me.userId, me.name, me.color, role]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, rolesSnap, hostId, me.userId, me.name, me.color, role, awarenessTick]);
 
   const getPathAccess = useMemo(() => {
     return (path: string, opts?: { asGuest?: boolean }): PathAccess => {
@@ -738,6 +690,13 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       });
     };
 
+    const setDefaultRole = (next: "viewer" | "editor") => {
+      if (!isHost) return;
+      session.doc.transact(() => {
+        roomMeta.set("defaultRole", next);
+      });
+    };
+
     const setShareTreeEnabled = (enabled: boolean) => {
       if (!isHost) return;
       session.doc.transact(() => {
@@ -785,6 +744,16 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       });
     };
 
+    // Viewers can't write to the doc, so requests and chat go through the
+    // server, which appends them with the sender's verified identity.
+    const sendToServer = (msg: Record<string, unknown>) => {
+      try {
+        session.provider.sendMessage(JSON.stringify(msg));
+      } catch {
+        // not connected; the user can retry
+      }
+    };
+
     const requestEdit = (path: string) => {
       const p = normalizePath(path);
       if (!p) return;
@@ -792,25 +761,12 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       // If we already have edit rights, no-op.
       if (levelRank(effectiveDocLevel(p)) >= levelRank("edit")) return;
 
-      // Avoid duplicates (same requester + same path)
       const existing = editReqArr.toArray().some((r: any) => {
         return r?.path === p && r?.requestedBy?.userId === me.userId;
       });
       if (existing) return;
 
-      const req: EditRequest = {
-        id:
-          typeof crypto !== "undefined" && "randomUUID" in crypto
-            ? (crypto as any).randomUUID()
-            : `req-${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`,
-        path: p,
-        requestedBy: { userId: me.userId, name: me.name },
-        createdAt: Date.now(),
-      };
-
-      session.doc.transact(() => {
-        editReqArr.push([req as any]);
-      });
+      sendToServer({ type: "edit-request", path: p });
     };
 
     const resolveEditRequest = (id: string, approve: boolean) => {
@@ -849,36 +805,26 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
 
     const requestTerminalControl = () => {
       if (isHost) return;
-      const exists = termReqArr
-        .toArray()
-        .some((x: any) => x?.userId === me.userId && !x?.resolvedAt);
+      if (termReqArr.toArray().some((x: any) => x?.userId === me.userId)) return;
+      sendToServer({ type: "terminal-request" });
+    };
 
-      if (exists) return;
-
-      const req = {
-        id:
-          typeof crypto !== "undefined" && "randomUUID" in crypto
-            ? (crypto as any).randomUUID()
-            : `termreq-${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`,
-        userId: me.userId,
-        name: me.name,
-        createdAt: Date.now(),
-      };
-
-      session.doc.transact(() => {
-        termReqArr.push([req as any]);
-      });
+    const sendChat = (text: string) => {
+      const t = text.trim();
+      if (t) sendToServer({ type: "chat", text: t });
     };
 
     return {
-      wsUrl: resolvedWsUrl,
+      room,
       roomId,
-      setRoomId,
 
       doc: session.doc,
       awareness: session.awareness,
       status,
       lastError,
+      synced,
+
+      sendChat,
 
       me,
       role,
@@ -893,6 +839,8 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
       canViewDoc,
       canEditDoc,
 
+      defaultRole,
+      setDefaultRole,
       setMemberRole,
 
       setShareTreeEnabled,
@@ -912,10 +860,11 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
     };
   }, [
     session,
-    resolvedWsUrl,
+    room,
     roomId,
     status,
     lastError,
+    synced,
     me,
     role,
     isHost,
@@ -929,7 +878,32 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
     canEditDoc,
     editRequestsSnap,
     terminalRequestsSnap,
+    defaultRole,
   ]);
+
+  if (fatalError) {
+    return (
+      <div style={{ padding: 24, fontFamily: "system-ui", maxWidth: 560 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Can't join “{room.name}”</div>
+        <div style={{ color: "crimson", whiteSpace: "pre-wrap" }}>{fatalError}</div>
+        {onLeave && (
+          <button
+            onClick={onLeave}
+            style={{
+              marginTop: 14,
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #d1d5db",
+              background: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Back to rooms
+          </button>
+        )}
+      </div>
+    );
+  }
 
   if (!value) {
     return (
@@ -939,19 +913,32 @@ VITE_COLLAB_WS_URL: ${String(envRaw ?? "").trim() || "(unset)"}`
     );
   }
 
-  if (lastError) {
-    return (
-      <div style={{ padding: 16, fontFamily: "system-ui" }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Collaboration error</div>
-        <div style={{ color: "crimson", whiteSpace: "pre-wrap" }}>{lastError}</div>
-        <div style={{ marginTop: 8, opacity: 0.7 }}>
-          If this says <b>room-full</b>, the room already has 10 users.
+  return (
+    <CollabContext.Provider value={value}>
+      {lastError && status !== "connected" && (
+        <div
+          role="status"
+          style={{
+            position: "fixed",
+            left: "50%",
+            bottom: 16,
+            transform: "translateX(-50%)",
+            zIndex: 10000,
+            padding: "8px 14px",
+            borderRadius: 8,
+            background: "#111827",
+            color: "#fff",
+            fontSize: 13,
+            fontFamily: "system-ui",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.2)",
+          }}
+        >
+          {lastError}
         </div>
-      </div>
-    );
-  }
-
-  return <CollabContext.Provider value={value}>{children}</CollabContext.Provider>;
+      )}
+      {children}
+    </CollabContext.Provider>
+  );
 }
 
 export function useCollab() {

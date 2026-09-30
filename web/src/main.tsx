@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import "./monacoSetup";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
@@ -14,7 +15,6 @@ if (!el) {
     `<pre style="padding:16px;white-space:pre-wrap">` +
     `❌ Root element #root not found.\n` +
     `Fix: ensure your loaded HTML contains: <div id="root"></div>\n` +
-    `Search: Get-ChildItem . -Recurse -Filter *.html | Select-String -Pattern 'id="root"'\n` +
     `</pre>`;
   throw new Error("Root element #root not found");
 }

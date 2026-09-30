@@ -1,84 +1,60 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useCollab } from "../collab/CollabProvider";
 import {
+  buildTree,
+  createDir,
+  createFile,
+  deletePath,
+  dirname,
+  getDirsMap,
+  getFilesMap,
+  joinPath,
+  looksBinary,
+  MAX_FILE_BYTES,
+  normalizePath,
+  renamePath,
+  writeFiles,
+  type TreeNode,
+} from "../collab/yFiles";
+import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  File,
+  FileCode,
+  FileImage,
+  FileJson,
+  FilePlus,
+  FileText,
   Folder,
   FolderOpen,
-  FileCode,
-  FileJson,
-  FileImage,
-  FileText,
-  File,
-  Terminal,
-  RefreshCw,
-  CornerLeftUp,
+  FolderPlus,
+  FolderUp,
+  Pencil,
   Settings,
-  ShieldAlert,
+  Terminal,
+  Trash2,
+  Upload,
 } from "lucide-react";
-type AnyEntry = any;
-
-type NormalEntry = {
-  name: string;
-  path: string;
-  type: "file" | "dir";
-};
-
-type ListResponse = {
-  path: string;
-  entries: AnyEntry[];
-};
-
-type ReadResponse =
-  | { content: string } // expected
-  | { data: string } // fallback
-  | string; // fallback
-
-export type RequestJson = <T = any>(path: string, opts?: RequestInit) => Promise<T>;
 
 type Props = {
-  requestJson: RequestJson;
-  initialPath?: string;
   activePath?: string;
-  onOpenFile?: (path: string, content?: string) => void;
+  onOpenFile?: (path: string) => void;
 };
 
-function normalizeEntry(e: AnyEntry): NormalEntry {
-  const rawPath: string =
-    e.path ?? e.full_path ?? e.file_path ?? e.filePath ?? e.abs_path ?? "";
-  const rawName: string =
-    e.name ?? e.filename ?? e.base ?? e.basename ?? rawPath.split(/[\\/]/).pop() ?? "";
-
-  const isDir =
-    e.type === "dir" ||
-    e.kind === "dir" ||
-    e.is_dir === true ||
-    e.isDir === true ||
-    e.directory === true;
-
-  return {
-    name: rawName,
-    path: rawPath,
-    type: isDir ? "dir" : "file",
-  };
-}
-
-function normalizePath(p: string) {
-  return (p ?? "").replace(/\\/g, "/").replace(/\/+/g, "/");
-}
-
-function accessMessage(reason: string) {
-  switch (reason) {
-    case "tree_not_shared":
-      return "Host has not shared the file tree.";
-    case "outside_shared_roots":
-      return "This path is outside the shared roots.";
-    case "hidden":
-      return "This path is hidden by the host.";
-    case "excluded":
-      return "This path is excluded by the host (cannot be opened).";
-    default:
-      return "Access denied.";
-  }
-}
+// Skipped when uploading a folder: large, generated, or private.
+const IGNORED_UPLOAD_SEGMENTS = new Set([
+  "node_modules",
+  ".git",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  ".cache",
+]);
 
 function PolicyModal({
   open,
@@ -173,7 +149,7 @@ function PolicyModal({
           </div>
         </div>
 
-        <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <input
               type="checkbox"
@@ -181,16 +157,16 @@ function PolicyModal({
               onChange={(e) => setShareTree(e.target.checked)}
             />
             <span style={{ fontSize: 13 }}>
-              Share Tree <span style={{ opacity: 0.7 }}>(OFF by default is safer)</span>
+              Share files with guests <span style={{ opacity: 0.7 }}>(off by default)</span>
             </span>
           </label>
 
           <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-            <button onClick={addCwdAsRoot} style={btn}>
-              Add cwd as root
+            <button onClick={addCwdAsRoot} style={btn} disabled={!cwd}>
+              Add selected folder
             </button>
-            <button onClick={setOnlyCwdRoot} style={btn}>
-              Only cwd
+            <button onClick={setOnlyCwdRoot} style={btn} disabled={!cwd}>
+              Only selected folder
             </button>
           </div>
         </div>
@@ -199,19 +175,19 @@ function PolicyModal({
           style={{
             marginTop: 12,
             display: "grid",
-            gridTemplateColumns: "1fr 1fr 1fr",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
             gap: 10,
           }}
         >
           <label style={{ display: "grid", gap: 6 }}>
             <span style={{ fontSize: 12, opacity: 0.8 }}>
-              Share roots (include-list). Empty = share everything.
+              Shared folders. Empty = share everything.
             </span>
             <textarea
               value={rootsText}
               onChange={(e) => setRootsText(e.target.value)}
               rows={10}
-              placeholder={"/src\n/docs"}
+              placeholder={"src\ndocs"}
               style={ta}
             />
           </label>
@@ -224,7 +200,7 @@ function PolicyModal({
               value={hideText}
               onChange={(e) => setHideText(e.target.value)}
               rows={10}
-              placeholder={"**/secrets/**\n.env"}
+              placeholder={"*secrets*\n.env"}
               style={ta}
             />
           </label>
@@ -237,7 +213,7 @@ function PolicyModal({
               value={excludeText}
               onChange={(e) => setExcludeText(e.target.value)}
               rows={10}
-              placeholder={"**/node_modules/**\n**/.git/**"}
+              placeholder={"*.key\nprivate/*"}
               style={ta}
             />
           </label>
@@ -264,199 +240,394 @@ function PolicyModal({
   );
 }
 
-export default function FileExplorer({
-  requestJson,
-  initialPath = "",
-  activePath,
-  onOpenFile,
-}: Props) {
-  const { isHost, visibility, getPathAccess } = useCollab();
+function getFileIcon(fileName: string) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".py")) return <FileCode size={16} color="#3572A5" />;
+  if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return <FileCode size={16} color="#3178C6" />;
+  if (lower.endsWith(".js") || lower.endsWith(".jsx") || lower.endsWith(".mjs"))
+    return <FileCode size={16} color="#CA8A04" />;
+  if (lower.endsWith(".json")) return <FileJson size={16} color="#CB3837" />;
+  if (lower.endsWith(".html")) return <FileCode size={16} color="#E34F26" />;
+  if (lower.endsWith(".css") || lower.endsWith(".scss")) return <FileCode size={16} color="#1572B6" />;
+  if (lower.endsWith(".md")) return <FileText size={16} color="#555555" />;
+  if (lower.match(/\.(png|jpe?g|gif|svg|ico)$/)) return <FileImage size={16} color="#10B981" />;
+  if (lower.endsWith(".sh") || lower.endsWith(".bash")) return <Terminal size={16} color="#16A34A" />;
+  return <File size={16} color="#6B7280" />;
+}
+
+async function readUploads(files: FileList | File[]) {
+  const entries: Array<{ path: string; content: string }> = [];
+  const skipped: string[] = [];
+
+  for (const f of Array.from(files)) {
+    const rel = normalizePath((f as any).webkitRelativePath || f.name);
+    if (!rel) continue;
+    if (rel.split("/").some((seg) => IGNORED_UPLOAD_SEGMENTS.has(seg))) continue;
+
+    if (f.size > MAX_FILE_BYTES) {
+      skipped.push(`${rel} (over 1 MB)`);
+      continue;
+    }
+    const content = await f.text();
+    if (looksBinary(content)) {
+      skipped.push(`${rel} (binary)`);
+      continue;
+    }
+    entries.push({ path: rel, content });
+  }
+  return { entries, skipped };
+}
+
+function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export default function FileExplorer({ activePath, onOpenFile }: Props) {
+  const { doc, isHost, role, room, visibility, getPathAccess } = useCollab();
 
   const [previewAsViewer, setPreviewAsViewer] = useState(false);
-
   const asGuest = !isHost || previewAsViewer;
+  const canModifyTree = role === "host" || role === "editor";
 
-  const [cwd, setCwd] = useState(initialPath);
-  const [entries, setEntries] = useState<NormalEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [selectedDir, setSelectedDir] = useState("");
   const [filter, setFilter] = useState("");
-
+  const [err, setErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [policyOpen, setPolicyOpen] = useState(false);
 
-  const filtered = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!q) return entries;
-    return entries.filter((x) => {
-      const hay = `${x.name} ${x.path}`.toLowerCase();
-      return hay.includes(q);
-    });
-  }, [entries, filter]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
 
-  const effectiveInitial = useMemo(() => {
-    if (!asGuest) return initialPath;
-    if (!visibility.shareTreeEnabled) return "";
-    const roots = visibility.shareRoots.filter(Boolean);
-    return roots.length > 0 ? roots[0] : initialPath;
-  }, [asGuest, initialPath, visibility.shareRoots, visibility.shareTreeEnabled]);
-
-  async function refresh(path = cwd) {
-    const p = path ?? "";
-
-    // enforce policy for guests
-    if (asGuest) {
-      const access = getPathAccess(p, { asGuest: true });
-      if (!access.ok) {
-        setEntries([]);
-        setCwd(p);
-        setErr(accessMessage(access.reason));
-        return;
-      }
-    }
-
-    setLoading(true);
-    setErr(null);
-
-    try {
-      const res = await requestJson<ListResponse>(`/fs/list?path=${encodeURIComponent(p)}`);
-      const normalized = (res.entries ?? []).map(normalizeEntry);
-
-      // client-side filtering by visibility policy (server should enforce in production)
-      const filteredByPolicy = asGuest
-        ? normalized.filter((x) => getPathAccess(x.path, { asGuest: true }).ok)
-        : normalized;
-
-      filteredByPolicy.sort((a, b) => {
-        if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-
-      setCwd(res.path ?? p);
-      setEntries(filteredByPolicy);
-    } catch (e: any) {
-      setErr(e?.message ?? "Failed to load directory");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function goUp() {
-    const p = (cwd ?? "").replace(/[\\\/]+$/, "");
-    if (!p) return;
-
-    const sep = p.includes("\\") ? "\\" : "/";
-    const idx = p.lastIndexOf(sep);
-
-    let next = idx <= 0 ? sep : p.slice(0, idx);
-
-    // Don't allow guests to leave the shared roots.
-    if (asGuest && visibility.shareRoots.length > 0) {
-      const roots = visibility.shareRoots.map(normalizePath).filter(Boolean);
-
-      // If next is not under any root, clamp to the first matching root for current cwd.
-      const currentNorm = normalizePath(cwd);
-      const currentRoot = roots.find((r) => currentNorm.startsWith(r.endsWith("/") ? r : r + "/")) ?? roots[0];
-      if (currentRoot && !normalizePath(next).startsWith(normalizePath(currentRoot))) {
-        next = currentRoot;
-      }
-    }
-
-    void refresh(next);
-  }
-
-  async function openEntry(e: NormalEntry) {
-    if (asGuest) {
-      const access = getPathAccess(e.path, { asGuest: true });
-      if (!access.ok) {
-        setErr(accessMessage(access.reason));
-        return;
-      }
-    }
-
-    if (e.type === "dir") {
-      await refresh(e.path);
-      return;
-    }
-
-    // Always notify selection immediately so editor can react.
-    onOpenFile?.(e.path);
-
-    // Optional: try to read content from backend; but don't block opening on it.
-    try {
-      const readRes = await requestJson<ReadResponse>(`/fs/read?path=${encodeURIComponent(e.path)}`);
-      const content =
-        typeof readRes === "string" ? readRes : (readRes as any)?.content ?? (readRes as any)?.data ?? "";
-
-      if (typeof content === "string") onOpenFile?.(e.path, content);
-    } catch {
-      // ignore read failure; file is still "opened" by path selection
-    }
-  }
-
+  // Re-render when files or folders are added/removed (not on text edits).
   useEffect(() => {
-    setCwd(effectiveInitial || "");
-    setEntries([]);
-    setErr(null);
+    const files = getFilesMap(doc);
+    const dirs = getDirsMap(doc);
+    const bump = () => setVersion((v) => v + 1);
+    files.observe(bump);
+    dirs.observe(bump);
+    return () => {
+      files.unobserve(bump);
+      dirs.unobserve(bump);
+    };
+  }, [doc]);
 
-    if (asGuest && !visibility.shareTreeEnabled) {
-      setErr("Host has not shared the file tree.");
+  const tree = useMemo(() => {
+    const include = (p: string) => !asGuest || getPathAccess(p, { asGuest: true }).ok;
+    return buildTree(doc, include);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc, version, asGuest, getPathAccess]);
+
+  const q = filter.trim().toLowerCase();
+
+  const visibleTree = useMemo(() => {
+    if (!q) return tree;
+    const prune = (nodes: TreeNode[]): TreeNode[] =>
+      nodes.flatMap((n) => {
+        if (n.type === "file") return n.path.toLowerCase().includes(q) ? [n] : [];
+        const kids = prune(n.children);
+        return kids.length || n.name.toLowerCase().includes(q) ? [{ ...n, children: kids }] : [];
+      });
+    return prune(tree);
+  }, [tree, q]);
+
+  // Reveal the active file's folders.
+  useEffect(() => {
+    if (!activePath) return;
+    const parts = normalizePath(activePath).split("/");
+    parts.pop();
+    if (!parts.length) return;
+    setExpanded((prev) => {
+      const next = { ...prev };
+      let acc = "";
+      for (const p of parts) {
+        acc = acc ? `${acc}/${p}` : p;
+        next[acc] = true;
+      }
+      return next;
+    });
+  }, [activePath]);
+
+  function flash(msg: string) {
+    setNotice(msg);
+    window.setTimeout(() => setNotice((m) => (m === msg ? null : m)), 5000);
+  }
+
+  function run(action: () => void) {
+    setErr(null);
+    try {
+      action();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  }
+
+  function onNewFile() {
+    const name = window.prompt(`New file in ${selectedDir || "(root)"}`, "main.py");
+    if (!name) return;
+    run(() => {
+      const p = createFile(doc, joinPath(selectedDir, name));
+      onOpenFile?.(p);
+    });
+  }
+
+  function onNewFolder() {
+    const name = window.prompt(`New folder in ${selectedDir || "(root)"}`);
+    if (!name) return;
+    run(() => {
+      const p = createDir(doc, joinPath(selectedDir, name));
+      setExpanded((e) => ({ ...e, [p]: true }));
+      setSelectedDir(p);
+    });
+  }
+
+  function onRename(node: TreeNode) {
+    const next = window.prompt("Rename / move to", node.path);
+    if (!next || normalizePath(next) === node.path) return;
+    run(() => {
+      const dst = renamePath(doc, node.path, next, { movePerms: isHost });
+      if (!dst) return;
+      if (activePath && (activePath === node.path || activePath.startsWith(node.path + "/"))) {
+        onOpenFile?.(dst + activePath.slice(node.path.length));
+      }
+    });
+  }
+
+  function onDelete(node: TreeNode) {
+    const what = node.type === "dir" ? `folder "${node.path}" and everything in it` : `"${node.path}"`;
+    if (!window.confirm(`Delete ${what}? This deletes it for everyone in the room.`)) return;
+    run(() => deletePath(doc, node.path));
+  }
+
+  async function onUpload(list: FileList | null, prefix: string) {
+    if (!list || list.length === 0) return;
+    setErr(null);
+    const { entries, skipped } = await readUploads(list);
+    const withPrefix = entries.map((e) => ({ ...e, path: joinPath(prefix, e.path) }));
+    const overwriting = withPrefix.filter((e) => getFilesMap(doc).has(e.path)).length;
+    if (overwriting > 0 && !window.confirm(`Overwrite ${overwriting} existing file(s)?`)) return;
+
+    writeFiles(doc, withPrefix);
+    flash(
+      `Uploaded ${withPrefix.length} file(s)` +
+        (skipped.length ? `; skipped ${skipped.length}: ${skipped.slice(0, 3).join(", ")}` : "")
+    );
+    if (withPrefix.length === 1) onOpenFile?.(withPrefix[0].path);
+  }
+
+  async function onDownloadZip() {
+    const { default: JSZip } = await import("jszip");
+    const zip = new JSZip();
+    let count = 0;
+    getFilesMap(doc).forEach((text, path) => {
+      if (asGuest && !getPathAccess(path, { asGuest: true }).ok) return;
+      zip.file(path, text.toString());
+      count++;
+    });
+    if (count === 0) {
+      flash("No files to download.");
       return;
     }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const safeName = room.name.replace(/[^\w.-]+/g, "_") || "project";
+    downloadBlob(`${safeName}.zip`, blob);
+  }
 
-    void refresh(effectiveInitial || "");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveInitial, asGuest, visibility.shareTreeEnabled, previewAsViewer]);
+  function toggleDir(path: string) {
+    setExpanded((e) => ({ ...e, [path]: !e[path] }));
+    setSelectedDir(path);
+  }
+
+  function renderNodes(nodes: TreeNode[], depth: number): React.ReactNode {
+    return nodes.map((n) => {
+      const isDir = n.type === "dir";
+      const open = !!q || !!expanded[n.path];
+      const isActive = !isDir && activePath === n.path;
+      const isSelectedDir = isDir && selectedDir === n.path;
+
+      return (
+        <React.Fragment key={n.path}>
+          <div
+            className="fx-row"
+            onClick={() => {
+              if (isDir) toggleDir(n.path);
+              else {
+                setSelectedDir(dirname(n.path));
+                onOpenFile?.(n.path);
+              }
+            }}
+            title={n.path}
+            style={{
+              padding: `5px 8px 5px ${10 + depth * 14}px`,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 13,
+              color: isActive ? "#000" : "#374151",
+              background: isActive ? "rgba(0,0,0,0.08)" : isSelectedDir ? "rgba(0,0,0,0.04)" : undefined,
+              userSelect: "none",
+            }}
+          >
+            <span style={{ width: 14, display: "inline-flex" }}>
+              {isDir ? open ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : null}
+            </span>
+            <span style={{ display: "inline-flex", width: 18, justifyContent: "center" }}>
+              {isDir ? (
+                open ? (
+                  <FolderOpen size={16} color="#EAB308" />
+                ) : (
+                  <Folder size={16} color="#EAB308" fill="#FEF08A" />
+                )
+              ) : (
+                getFileIcon(n.name)
+              )}
+            </span>
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {n.name}
+            </span>
+            {canModifyTree && (
+              <span className="fx-actions" style={{ display: "inline-flex", gap: 2 }}>
+                <button
+                  style={iconBtnStyle}
+                  title="Rename / move"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRename(n);
+                  }}
+                >
+                  <Pencil size={13} color="#6B7280" />
+                </button>
+                <button
+                  style={iconBtnStyle}
+                  title="Delete"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(n);
+                  }}
+                >
+                  <Trash2 size={13} color="#6B7280" />
+                </button>
+              </span>
+            )}
+          </div>
+          {isDir && open && renderNodes(n.children, depth + 1)}
+        </React.Fragment>
+      );
+    });
+  }
+
+  const emptyMessage =
+    asGuest && !visibility.shareTreeEnabled
+      ? "The host hasn't shared files with guests yet."
+      : q
+        ? "No matching files."
+        : canModifyTree
+          ? "No files yet. Create or upload some to get started."
+          : "No files yet.";
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "8px 10px", display: "flex", gap: 6, alignItems: "center" }}>
-        <div style={{ fontWeight: 600, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.05em", color: "#4B5563", flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
+      <style>{`.fx-row .fx-actions{visibility:hidden}.fx-row:hover{background:rgba(0,0,0,0.04)}.fx-row:hover .fx-actions{visibility:visible}`}</style>
+
+      <div style={{ padding: "8px 10px", display: "flex", gap: 4, alignItems: "center" }}>
+        <div
+          style={{
+            fontWeight: 600,
+            fontSize: 11,
+            textTransform: "uppercase",
+            letterSpacing: "0.05em",
+            color: "#4B5563",
+            flex: 1,
+          }}
+        >
           Explorer
         </div>
 
-        {isHost && (
+        {canModifyTree && (
           <>
-            <button onClick={() => setPolicyOpen(true)} style={iconBtnStyle} title="Sharing Policy">
-              <Settings size={14} color="#4B5563" />
+            <button onClick={onNewFile} style={iconBtnStyle} title="New file">
+              <FilePlus size={15} color="#4B5563" />
             </button>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, opacity: 0.85, marginRight: 8 }}>
-              <input
-                type="checkbox"
-                checked={previewAsViewer}
-                onChange={(e) => setPreviewAsViewer(e.target.checked)}
-              />
-              Preview
-            </label>
+            <button onClick={onNewFolder} style={iconBtnStyle} title="New folder">
+              <FolderPlus size={15} color="#4B5563" />
+            </button>
+            <button onClick={() => fileInputRef.current?.click()} style={iconBtnStyle} title="Upload files">
+              <Upload size={15} color="#4B5563" />
+            </button>
+            <button onClick={() => folderInputRef.current?.click()} style={iconBtnStyle} title="Upload folder">
+              <FolderUp size={15} color="#4B5563" />
+            </button>
           </>
         )}
-
-        <button onClick={goUp} disabled={loading} style={iconBtnStyle} title="Go Up (Parent Directory)">
-          <CornerLeftUp size={14} color={loading ? "#9CA3AF" : "#4B5563"} />
+        <button onClick={() => void onDownloadZip()} style={iconBtnStyle} title="Download project as .zip">
+          <Download size={15} color="#4B5563" />
         </button>
-        <button onClick={() => refresh()} disabled={loading} style={iconBtnStyle} title="Refresh Explorer">
-          <RefreshCw size={14} color={loading ? "#9CA3AF" : "#4B5563"} />
-        </button>
+        {isHost && (
+          <button onClick={() => setPolicyOpen(true)} style={iconBtnStyle} title="Sharing policy">
+            <Settings size={15} color="#4B5563" />
+          </button>
+        )}
       </div>
 
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        hidden
+        onChange={(e) => {
+          void onUpload(e.target.files, selectedDir);
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={folderInputRef}
+        type="file"
+        hidden
+        {...({ webkitdirectory: "", directory: "" } as any)}
+        onChange={(e) => {
+          void onUpload(e.target.files, selectedDir);
+          e.target.value = "";
+        }}
+      />
+
       <div
-        title={cwd}
         style={{
           padding: "0 10px 8px 10px",
           fontSize: 12,
           color: "#6B7280",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
           borderBottom: "1px solid #E5E7EB",
-          marginBottom: 8
+          marginBottom: 8,
         }}
       >
-        {cwd || "(root)"}{" "}
-        {asGuest && (
-          <span style={{ marginLeft: 6, opacity: 0.9 }}>
-            • shared • roots:{visibility.shareRoots.length || "all"} • hidden:{visibility.hidePatterns.length} •
-            excluded:{visibility.excludePatterns.length}
-          </span>
+        <span
+          style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title="New files and uploads go into this folder"
+          onClick={() => setSelectedDir("")}
+        >
+          in: {selectedDir || "(root)"}
+        </span>
+        {isHost && (
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }} title="See the tree as guests do">
+            <input
+              type="checkbox"
+              checked={previewAsViewer}
+              onChange={(e) => setPreviewAsViewer(e.target.checked)}
+            />
+            Guest view
+          </label>
         )}
       </div>
 
@@ -467,6 +638,7 @@ export default function FileExplorer({
           placeholder="Filter..."
           style={{
             width: "100%",
+            boxSizing: "border-box",
             padding: "8px 10px",
             borderRadius: 8,
             border: "1px solid #d1d5db",
@@ -475,86 +647,23 @@ export default function FileExplorer({
         />
       </div>
 
-      {err && (
-        <div style={{ padding: "0 10px 10px 10px", color: "crimson", fontSize: 12 }}>{err}</div>
-      )}
+      {err && <div style={{ padding: "0 10px 10px 10px", color: "crimson", fontSize: 12 }}>{err}</div>}
+      {notice && <div style={{ padding: "0 10px 10px 10px", color: "#065F46", fontSize: 12 }}>{notice}</div>}
 
-      <div style={{ flex: 1, overflow: "auto" }}>
-        {loading && entries.length === 0 ? (
-          <div style={{ padding: 10, opacity: 0.75 }}>Loading…</div>
-        ) : filtered.length === 0 ? (
-          <div style={{ padding: 10, opacity: 0.75 }}>
-            {asGuest && !visibility.shareTreeEnabled ? "No shared files." : "No entries."}
-          </div>
+      <div
+        style={{ flex: 1, overflow: "auto" }}
+        onClick={(e) => {
+          if (e.target === e.currentTarget) setSelectedDir("");
+        }}
+      >
+        {visibleTree.length === 0 ? (
+          <div style={{ padding: 10, opacity: 0.75, fontSize: 13 }}>{emptyMessage}</div>
         ) : (
-          filtered.map((e) => {
-            const isActive = !!activePath && activePath === e.path;
-
-            // Helper to determine the file icon
-            const getFileIcon = (fileName: string) => {
-              const lower = fileName.toLowerCase();
-              if (lower.endsWith(".py")) return <FileCode size={16} color="#3572A5" />; // Blue
-              if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return <FileCode size={16} color="#3178C6" />; // TS Blue
-              if (lower.endsWith(".js") || lower.endsWith(".jsx")) return <FileCode size={16} color="#F7DF1E" />; // JS Yellow
-              if (lower.endsWith(".json")) return <FileJson size={16} color="#CB3837" />; // Red
-              if (lower.endsWith(".html")) return <FileCode size={16} color="#E34F26" />; // HTML Orange
-              if (lower.endsWith(".css") || lower.endsWith(".scss")) return <FileCode size={16} color="#1572B6" />; // CSS Blue
-              if (lower.endsWith(".md")) return <FileText size={16} color="#555555" />;
-              if (lower.match(/\.(png|jpe?g|gif|svg|ico)$/)) return <FileImage size={16} color="#10B981" />; // Green
-              if (lower.endsWith(".sh") || lower.endsWith(".bash")) return <Terminal size={16} color="#4ADE80" />;
-              return <File size={16} color="#6B7280" />; // Gray fallback
-            };
-
-            return (
-              <div
-                key={e.path}
-                onClick={() => void openEntry(e)}
-                onDoubleClick={() => void openEntry(e)}
-                title={e.path}
-                style={{
-                  padding: "6px 10px 6px 14px",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  fontSize: 13,
-                  color: isActive ? "#000" : "#374151", // darker text for active
-                  background: isActive ? "rgba(0, 0, 0, 0.08)" : "transparent",
-                  transition: "background 0.1s ease",
-                  userSelect: "none"
-                }}
-                onMouseEnter={(ev) => {
-                  if (!isActive) ev.currentTarget.style.background = "rgba(0, 0, 0, 0.04)";
-                }}
-                onMouseLeave={(ev) => {
-                  if (!isActive) ev.currentTarget.style.background = "transparent";
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 18 }}>
-                  {e.type === "dir" ? (
-                    <Folder size={16} color="#EAB308" fill="#FEF08A" />
-                  ) : (
-                    getFileIcon(e.name)
-                  )}
-                </div>
-                <span
-                  style={{
-                    flex: 1,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontFamily: "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
-                  }}
-                >
-                  {e.name}
-                </span>
-              </div>
-            );
-          })
+          renderNodes(visibleTree, 0)
         )}
       </div>
 
-      <PolicyModal open={policyOpen} onClose={() => setPolicyOpen(false)} cwd={cwd} />
+      <PolicyModal open={policyOpen} onClose={() => setPolicyOpen(false)} cwd={selectedDir} />
     </div>
   );
 }
@@ -580,6 +689,7 @@ const btn: React.CSSProperties = {
 
 const ta: React.CSSProperties = {
   width: "100%",
+  boxSizing: "border-box",
   padding: "8px 10px",
   borderRadius: 10,
   border: "1px solid #d1d5db",
