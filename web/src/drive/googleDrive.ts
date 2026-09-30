@@ -2,9 +2,9 @@
  * Google Drive integration (client-side only — no tokens ever touch our server).
  *
  * Flow, matching the room model where files live in the shared Y.Doc:
- *   - The host links the room to a Drive folder (Google Picker).
- *   - "Import" pulls the folder's text files into the doc.
- *   - "Save to Drive" pushes the doc's files back into that folder.
+ *   - "Import" opens the Google Picker; the user signs in and selects any mix
+ *     of files and folders, which are pulled into the doc (folders recursively).
+ *   - "Save to Drive" pushes the doc's files back into a chosen folder.
  *
  * Access uses the `drive.file` scope: combined with the Picker, Google grants
  * the app access only to the folder the user explicitly chose (and its
@@ -28,6 +28,7 @@ const SCOPE = "https://www.googleapis.com/auth/drive.file";
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 export type DriveFolder = { id: string; name: string };
+export type DriveItem = { id: string; name: string; mimeType: string };
 export type ImportEntry = { path: string; content: string };
 export type ImportResult = { entries: ImportEntry[]; skipped: string[] };
 export type PushResult = { created: number; updated: number; skipped: string[] };
@@ -158,6 +159,50 @@ export async function pickFolder(): Promise<DriveFolder | null> {
   });
 }
 
+/**
+ * Opens the Google Picker allowing multi-select of both files and folders.
+ * Signs the user in first (consent popup on first use). Resolves [] if
+ * cancelled. Whatever the user picks is what `drive.file` grants us access to.
+ */
+export async function pickItems(): Promise<DriveItem[]> {
+  const token = await getAccessToken();
+  await loadPicker();
+
+  return new Promise<DriveItem[]>((resolve, reject) => {
+    try {
+      const google = window.google;
+      // DOCS view, folders included and selectable, so the user can tick any
+      // mix of individual files and whole folders.
+      const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
+        .setIncludeFolders(true)
+        .setSelectFolderEnabled(true)
+        .setParent("root");
+
+      const picker = new google.picker.PickerBuilder()
+        .enableFeature(google.picker.Feature.MULTISELECT_ENABLED)
+        .addView(view)
+        .setOAuthToken(token)
+        .setDeveloperKey(API_KEY)
+        .setTitle("Choose files or folders to import")
+        .setCallback((data: any) => {
+          const action = data[google.picker.Response.ACTION];
+          if (action === google.picker.Action.PICKED) {
+            const docs = data[google.picker.Response.DOCUMENTS] ?? [];
+            resolve(
+              docs.map((d: any) => ({ id: d.id, name: d.name, mimeType: d.mimeType }))
+            );
+          } else if (action === google.picker.Action.CANCEL) {
+            resolve([]);
+          }
+        })
+        .build();
+      picker.setVisible(true);
+    } catch (e) {
+      reject(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Drive REST helpers                                                  */
 /* ------------------------------------------------------------------ */
@@ -205,13 +250,45 @@ async function downloadText(fileId: string, token: string): Promise<string> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Import: Drive folder -> flat list of text files                     */
+/* Import: picked files/folders -> flat list of text files             */
 /* ------------------------------------------------------------------ */
 
-export async function importFolder(folderId: string): Promise<ImportResult> {
+/**
+ * Imports whatever the user picked — any mix of individual files and folders —
+ * into a flat path->content list. Folders are walked recursively; a picked
+ * item keeps its own name as the top-level path (folder "src" -> "src/…",
+ * file "notes.py" -> "notes.py"). Google-native docs, binaries and files over
+ * MAX_FILE_BYTES are reported in `skipped` rather than imported.
+ */
+export async function importItems(items: DriveItem[]): Promise<ImportResult> {
   const token = await getAccessToken();
   const entries: ImportEntry[] = [];
   const skipped: string[] = [];
+
+  const importFile = async (
+    file: { id: string; name: string; mimeType: string },
+    rel: string
+  ) => {
+    // Google-native docs (Docs/Sheets/…) have no raw bytes to download.
+    if (file.mimeType.startsWith("application/vnd.google-apps")) {
+      skipped.push(`${rel} (Google ${file.mimeType.split(".").pop()})`);
+      return;
+    }
+    try {
+      const content = await downloadText(file.id, token);
+      if (content.length > MAX_FILE_BYTES) {
+        skipped.push(`${rel} (over 1 MB)`);
+        return;
+      }
+      if (looksBinary(content)) {
+        skipped.push(`${rel} (binary)`);
+        return;
+      }
+      entries.push({ path: rel, content });
+    } catch {
+      skipped.push(`${rel} (download failed)`);
+    }
+  };
 
   const walk = async (id: string, prefix: string) => {
     const children = await listChildren(id, token);
@@ -220,31 +297,21 @@ export async function importFolder(folderId: string): Promise<ImportResult> {
       if (!rel) continue;
       if (child.mimeType === FOLDER_MIME) {
         await walk(child.id, rel);
-        continue;
-      }
-      // Google-native docs (Docs/Sheets/…) have no raw bytes to download.
-      if (child.mimeType.startsWith("application/vnd.google-apps")) {
-        skipped.push(`${rel} (Google ${child.mimeType.split(".").pop()})`);
-        continue;
-      }
-      try {
-        const content = await downloadText(child.id, token);
-        if (content.length > MAX_FILE_BYTES) {
-          skipped.push(`${rel} (over 1 MB)`);
-          continue;
-        }
-        if (looksBinary(content)) {
-          skipped.push(`${rel} (binary)`);
-          continue;
-        }
-        entries.push({ path: rel, content });
-      } catch {
-        skipped.push(`${rel} (download failed)`);
+      } else {
+        await importFile(child, rel);
       }
     }
   };
 
-  await walk(folderId, "");
+  for (const item of items) {
+    const base = normalizePath(item.name);
+    if (!base) continue;
+    if (item.mimeType === FOLDER_MIME) {
+      await walk(item.id, base);
+    } else {
+      await importFile(item, base);
+    }
+  }
   return { entries, skipped };
 }
 

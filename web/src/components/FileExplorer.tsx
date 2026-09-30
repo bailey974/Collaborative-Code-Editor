@@ -39,9 +39,10 @@ import {
   Upload,
 } from "lucide-react";
 import {
-  importFolder,
+  importItems,
   isDriveConfigured,
   pickFolder,
+  pickItems,
   pushFiles,
   type ImportEntry,
 } from "../drive/googleDrive";
@@ -316,9 +317,6 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
   const [notice, setNotice] = useState<string | null>(null);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [driveBusy, setDriveBusy] = useState<null | "import" | "push" | "link">(null);
-  // Offer a one-click import when opening a room already linked to Drive.
-  const [importOffer, setImportOffer] = useState(false);
-  const offeredRef = useRef(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -371,14 +369,6 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
       return next;
     });
   }, [activePath]);
-
-  // On opening a room that's already linked to Drive, offer a one-click import.
-  useEffect(() => {
-    if (driveOn && driveFolder && !offeredRef.current) {
-      offeredRef.current = true;
-      setImportOffer(true);
-    }
-  }, [driveOn, driveFolder]);
 
   function flash(msg: string) {
     setNotice(msg);
@@ -467,7 +457,11 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
 
   async function applyDriveImport(entries: ImportEntry[], skipped: string[]) {
     if (entries.length === 0) {
-      flash(skipped.length ? `Nothing imported; skipped ${skipped.length}.` : "That folder has no importable files.");
+      flash(
+        skipped.length
+          ? `Nothing imported; skipped ${skipped.length}.`
+          : "Nothing importable in that selection."
+      );
       return;
     }
     const files = getFilesMap(doc);
@@ -479,52 +473,46 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
       `Imported ${entries.length} file(s) from Drive` +
         (skipped.length ? `; skipped ${skipped.length}: ${skipped.slice(0, 3).join(", ")}` : "")
     );
-    if (entries.length === 1) onOpenFile?.(normalizePath(entries[0].path));
+    // Jump to the first imported file so the user sees it right away.
+    onOpenFile?.(normalizePath(entries[0].path));
   }
 
-  // Import from Drive. If no folder is linked yet, the host picks one first.
+  // Import from Drive: sign in, pick any mix of files/folders, pull into the tree.
   async function onDriveImport() {
     setErr(null);
     try {
-      let folder = driveFolder;
-      if (!folder) {
-        if (!isHost) {
-          setErr("Ask the host to link a Google Drive folder first.");
-          return;
-        }
-        setDriveBusy("link");
-        const picked = await pickFolder();
-        if (!picked) return;
-        setDriveFolder(picked);
-        folder = picked;
-      }
       setDriveBusy("import");
-      const { entries, skipped } = await importFolder(folder.id);
+      const items = await pickItems();
+      if (items.length === 0) return; // cancelled
+      const { entries, skipped } = await importItems(items);
       await applyDriveImport(entries, skipped);
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
       setDriveBusy(null);
-      setImportOffer(false);
     }
   }
 
-  // Push every file in the room back into the linked Drive folder.
+  // Save every file in the room to a Drive folder (the linked one, or one picked now).
   async function onDrivePush() {
     setErr(null);
-    if (!driveFolder) {
-      setErr("Link a Google Drive folder first (Import from Drive).");
-      return;
-    }
     try {
-      setDriveBusy("push");
       const entries: ImportEntry[] = [];
       getFilesMap(doc).forEach((text, path) => entries.push({ path, content: text.toString() }));
       if (entries.length === 0) {
         flash("No files to save.");
         return;
       }
-      const res = await pushFiles(driveFolder.id, entries);
+      let target = driveFolder;
+      if (!target) {
+        setDriveBusy("link");
+        const picked = await pickFolder();
+        if (!picked) return;
+        target = picked;
+        setDriveFolder(picked); // host-only persists; others just use it for this save
+      }
+      setDriveBusy("push");
+      const res = await pushFiles(target.id, entries);
       flash(
         `Saved to Drive: ${res.created} new, ${res.updated} updated` +
           (res.skipped.length ? `, ${res.skipped.length} skipped` : "")
@@ -682,24 +670,18 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
                   onClick={() => void onDriveImport()}
                   style={iconBtnStyle}
                   disabled={driveBusy !== null}
-                  title={
-                    driveFolder
-                      ? `Import from Google Drive folder “${driveFolder.name}”`
-                      : isHost
-                        ? "Link a Google Drive folder and import it"
-                        : "Ask the host to link a Google Drive folder"
-                  }
+                  title="Import files or folders from Google Drive"
                 >
                   <CloudDownload size={15} color={driveBusy === "import" ? "#9CA3AF" : "#4B5563"} />
                 </button>
                 <button
                   onClick={() => void onDrivePush()}
                   style={iconBtnStyle}
-                  disabled={driveBusy !== null || !driveFolder}
+                  disabled={driveBusy !== null}
                   title={
                     driveFolder
                       ? `Save all files to Google Drive folder “${driveFolder.name}”`
-                      : "Link a Drive folder first"
+                      : "Save all files to a Google Drive folder"
                   }
                 >
                   <CloudUpload size={15} color={driveBusy === "push" ? "#9CA3AF" : "#4B5563"} />
@@ -770,7 +752,7 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
         )}
       </div>
 
-      {driveOn && (driveFolder || isHost) && (
+      {driveOn && driveFolder && (
         <div
           style={{
             padding: "0 10px 8px 10px",
@@ -781,11 +763,11 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
             gap: 6,
           }}
         >
-          <CloudDownload size={12} />
+          <CloudUpload size={12} />
           <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            Drive: {driveFolder ? driveFolder.name : "not linked"}
+            Save target: {driveFolder.name}
           </span>
-          {isHost && driveFolder && (
+          {isHost && (
             <button
               onClick={() => void onDriveRelink()}
               style={{ ...btn, padding: "2px 8px", fontSize: 11 }}
@@ -815,34 +797,6 @@ export default function FileExplorer({ activePath, onOpenFile }: Props) {
 
       {err && <div style={{ padding: "0 10px 10px 10px", color: "crimson", fontSize: 12 }}>{err}</div>}
       {notice && <div style={{ padding: "0 10px 10px 10px", color: "#065F46", fontSize: 12 }}>{notice}</div>}
-
-      {driveOn && importOffer && driveFolder && canModifyTree && (
-        <div
-          style={{
-            margin: "0 10px 10px 10px",
-            padding: "8px 10px",
-            borderRadius: 8,
-            border: "1px solid #bfdbfe",
-            background: "#eff6ff",
-            fontSize: 12,
-            color: "#1e3a8a",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          <CloudDownload size={14} />
-          <span style={{ flex: 1 }}>
-            Linked to Drive folder “{driveFolder.name}”.
-          </span>
-          <button onClick={() => void onDriveImport()} style={btn} disabled={driveBusy !== null}>
-            {driveBusy === "import" ? "Importing…" : "Import latest"}
-          </button>
-          <button onClick={() => setImportOffer(false)} style={iconBtnStyle} title="Dismiss">
-            ✕
-          </button>
-        </div>
-      )}
 
       <div
         style={{ flex: 1, overflow: "auto" }}
