@@ -1,0 +1,46 @@
+name: Deploy to Cloudflare
+
+# Builds the web client and deploys the Worker on every push to main.
+# Requires these repository secrets (Settings > Secrets and variables > Actions):
+#   CLOUDFLARE_API_TOKEN   - a token with "Edit Cloudflare Workers" permission
+#   CLOUDFLARE_ACCOUNT_ID  - d33f00e398dfde4d8ad88ddf72425a05
+#   VITE_GOOGLE_CLIENT_ID  - (optional) enables the Drive buttons in the build
+#   VITE_GOOGLE_API_KEY    - (optional) required by the Google Picker
+# Without the two VITE_GOOGLE_* secrets the site still deploys; the Drive
+# buttons just stay hidden. JWT_SECRET is already stored in the Worker and is
+# not touched by a deploy.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install and build web client
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+        env:
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_API_KEY: ${{ secrets.VITE_GOOGLE_API_KEY }}
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Deploy Worker (serves web/dist)
+        working-directory: server
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
