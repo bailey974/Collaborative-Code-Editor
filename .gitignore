@@ -1,16 +1,102 @@
-# dependencies
+# =====================================================================
+# Collaborative Code Editor — root .gitignore
+# Covers: desktop/ (React + Vite web client, legacy Tauri shell),
+#         backend/ (Django), collab-server/ (y-websocket)
+# =====================================================================
+
+# ---------- Secrets & local env ----------
+# Vite exposes only VITE_* vars and they end up in the public bundle, so
+# never put secrets in frontend env files. Commit a .env.example instead.
+.env
+.env.local
+.env.*.local
+*.local
+!.env.example
+backend/.env
+*.pem
+*.key
+
+# ---------- Node / frontend ----------
 node_modules/
 **/node_modules/
-
-# python env
-.venv/
-
-# build outputs
 dist/
 **/dist/
-desktop/src-tauri/target/
-**/target/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+coverage/
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# misc
+# ---------- Python / Django ----------
+.venv/
+**/.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+# Local dev database — production uses Postgres via DATABASE_URL
+*.sqlite3
+*.sqlite3-journal
+# collectstatic output (rebuilt on deploy by backend/build.sh)
+backend/staticfiles/
+# User uploads, if/when added
+backend/media/
+
+# ---------- Collab server persistence ----------
+# y-websocket / LevelDB room data written at runtime
+**/collab-server/db/
+*.ldb
+
+# ---------- Tauri / Rust (legacy desktop build) ----------
+**/src-tauri/target/
+**/src-tauri/gen/schemas/
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.pdb
+
+# ---------- Cloudflare Workers (server/) ----------
+# Wrangler secrets for local dev (JWT_SECRET etc.) — commit .dev.vars.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+# Local Miniflare/D1/Durable Object state written by `wrangler dev`
+.wrangler/
+**/.wrangler/
+
+# ---------- Hosting / deploy tooling ----------
+.vercel/
+.netlify/
+.render/
+
+# ---------- Testing ----------
+test-results/
+playwright-report/
+playwright/.cache/
+
+# ---------- Editors & OS ----------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*.suo
 .DS_Store
+Thumbs.db
+desktop.ini
 *.log
+logs/
+
+# ---------- Local-only leftovers ----------
+.git-broken-backup/

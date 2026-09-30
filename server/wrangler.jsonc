@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "collab-code-editor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+
+  // The built web app (web/dist) is served from this same Worker, so the site,
+  // the REST API and the collaboration WebSockets all share one origin.
+  "assets": {
+    "directory": "../web/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/parties/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "collab-db",
+      // Replace with the id printed by `npx wrangler d1 create collab-db`.
+      // Any value works for local development.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "Room", "class_name": "Room" }]
+  },
+
+  // Free plan requires SQLite-backed Durable Objects.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+
+  "observability": { "enabled": true }
+}

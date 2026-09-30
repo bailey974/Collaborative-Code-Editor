@@ -1,0 +1,24 @@
+{
+  "name": "collab-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply collab-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply collab-db --remote",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.13.12",
+    "jose": "^6.2.12",
+    "partyserver": "^0.5.10",
+    "y-partyserver": "^2.2.0",
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "~5.9",
+    "wrangler": "^4.144.0"
+  }
+}

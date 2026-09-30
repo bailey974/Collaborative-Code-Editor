@@ -1,0 +1,9 @@
+# Local dev secrets for `wrangler dev`. Copy to `.dev.vars` (git-ignored).
+#
+#   cp .dev.vars.example .dev.vars
+#
+# In production this is set once with:
+#   npx wrangler secret put JWT_SECRET
+#
+# Use a long random string. Any value works for local development.
+JWT_SECRET=dev-only-secret-change-me
