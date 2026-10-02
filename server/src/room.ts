@@ -57,6 +57,7 @@ export class Room extends YServer {
 
   private snapshot: Snapshot = {};
   private guardInstalled = false;
+  private destroyed = false;
 
   /* ---------- persistence ---------- */
 
@@ -81,6 +82,7 @@ export class Room extends YServer {
   }
 
   async onSave() {
+    if (this.destroyed) return;
     const update = Y.encodeStateAsUpdate(this.document);
     this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql;
@@ -89,6 +91,25 @@ export class Room extends YServer {
         sql.exec("INSERT INTO ydoc (chunk, data) VALUES (?, ?)", chunk, update.slice(i, i + CHUNK_BYTES));
       }
     });
+  }
+
+  /* ---------- RPC from the Worker (index.ts) ---------- */
+
+  /** Called after the host renames the room in D1. */
+  async rename(name: string) {
+    const meta = this.document.getMap<unknown>(Y_ROOM_META);
+    this.document.transact(() => meta.set("name", name), SERVER_ORIGIN);
+  }
+
+  /** Called after the room is deleted from D1: disconnect everyone, drop the doc. */
+  async destroy() {
+    this.destroyed = true;
+    // Tell clients through the doc first: it arrives as a normal sync message,
+    // whereas a close frame's reason isn't always delivered promptly.
+    const meta = this.document.getMap<unknown>(Y_ROOM_META);
+    this.document.transact(() => meta.set("deleted", true), SERVER_ORIGIN);
+    for (const conn of this.getConnections()) conn.close(4004, "room-deleted");
+    await this.ctx.storage.deleteAll();
   }
 
   /* ---------- connections ---------- */
@@ -102,6 +123,10 @@ export class Room extends YServer {
 
     if (!userId) {
       conn.close(4001, "unauthorized");
+      return;
+    }
+    if (this.destroyed) {
+      conn.close(4004, "room-deleted");
       return;
     }
 

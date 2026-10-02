@@ -21,9 +21,9 @@ server/    Cloudflare Worker: web hosting + REST API + realtime WebSockets
 Everything is served from one origin: the Worker hosts the built site
 (`web/dist`), the `/api/*` endpoints and the `/parties/*` collaboration sockets.
 
-> `backend/` (Django), the old `collab-server/` (y-websocket) and `desktop/`
-> (the legacy Tauri shell) are the previous desktop-app architecture, kept for
-> history. The live web app is **`web/` + `server/`**.
+> This started as a Tauri desktop app with a Django backend and a y-websocket
+> server. That code has been removed; it's still in the git history (before
+> commit `1acbbd23`). The app is now just **`web/` + `server/`**.
 
 ## Quick start (local)
 

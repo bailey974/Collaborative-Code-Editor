@@ -2,7 +2,7 @@
 
 Collaborative Code Editor: a real-time, multi-user code editor (Monaco + Yjs) with rooms, chat, a shared file explorer and an in-browser code runner. Originally a **Tauri desktop app** for a third-year university project (DCU CSC1049), now **a website that runs fully in the browser** and deploys free on Cloudflare.
 
-The live app is **`web/` (client) + `server/` (Cloudflare Worker)**. Don't add Tauri or Rust code, and don't add to the legacy `backend/` (Django) or the old root `collab-server/` (y-websocket) — they're the previous desktop/Render architecture kept only for history and are being removed.
+The live app is **`web/` (client) + `server/` (Cloudflare Worker)**. Don't add Tauri or Rust code, and don't bring back the old Django `backend/`, `desktop/` shell or `collab-server/` (y-websocket) — they were the previous desktop/Render architecture and have been removed (they're only in git history).
 
 ## Repository layout
 
@@ -19,7 +19,6 @@ server/             One Cloudflare Worker = the whole backend (free plan)
   migrations/         D1 (SQLite) schema: users, rooms, room_members, rate_limits
   wrangler.jsonc      Bindings: DB (D1), Room (Durable Object), static assets (../web/dist)
 functional_requirements/, technical_specification/, user_manual/   Coursework PDFs, don't edit
-backend/, desktop/, collab-server/   LEGACY (Django / Tauri shell / old y-websocket); being removed
 ```
 
 ## Commands
@@ -43,7 +42,7 @@ Server (`cd server`, Cloudflare Worker via Wrangler):
 One origin serves everything: the Worker hosts the built site (`web/dist`), the `/api/*` REST endpoints and the `/parties/*` collaboration sockets. No CORS, no Render, nothing to keep awake.
 
 - **Auth:** the client POSTs to `/api/auth/login` or `/api/auth/register` (Hono, in `server/src/index.ts`) and stores the returned JWT access token in `localStorage`. Requests send `Authorization: Bearer <token>`. Passwords are PBKDF2-SHA256; tokens are HS256 signed with `JWT_SECRET` (`server/src/auth.ts`).
-- **Rooms:** stored in **D1** (SQLite). `/api/rooms*` creates/lists/joins/leaves rooms and issues join codes. The Yjs room name is the room's D1 id.
+- **Rooms:** stored in **D1** (SQLite). `/api/rooms*` creates/lists/joins/leaves rooms and issues join codes; the host (`rooms.created_by`) can rename (`PATCH /api/rooms/:id`) or delete (`DELETE /api/rooms/:id`) a room. Both then call RPC methods on the Room DO (`rename` pushes the name into `room:meta`; `destroy` closes sockets with `room-deleted` and wipes its storage). The Yjs room name is the room's D1 id.
 - **Real-time state:** a single `Y.Doc` per room lives in a **Durable Object** (`server/src/room.ts`, built on `y-partyserver`), which syncs it to every client and persists it to the DO's own SQLite storage. The doc holds file contents, room metadata, roles, visibility rules, per-doc permissions, edit and terminal requests, terminal policy and chat. Presence and cursors use awareness (`presenceStyles.ts`). Y.Doc key names are shared between `web/src/collab/CollabProvider.tsx` and `server/src/room.ts` — keep them in sync.
 - **Collaboration auth:** the client opens `wss://<origin>/parties/room/<roomId>?token=<jwt>`. `authorizeSocket` in `index.ts` verifies the JWT **and** D1 room membership before the socket reaches the DO, strips any client-sent `x-collab-*` headers and injects trusted identity headers. The DO reverts host-only state from a trusted snapshot if a non-host touches it. (Verified: member→101, missing/bad token→401, non-member→403.)
 - **Files:** per-room, stored in the Y.Doc (no host filesystem access). FileExplorer reads/writes through the shared doc.
