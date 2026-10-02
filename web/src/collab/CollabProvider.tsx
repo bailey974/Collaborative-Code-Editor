@@ -220,7 +220,11 @@ function resolveCollabServer() {
 const FATAL_CLOSE_REASONS: Record<string, string> = {
   "room-full": "This room already has the maximum number of people connected.",
   unauthorized: "Your session is not authorised for this room. Try signing in again.",
+  "room-deleted": "The host deleted this room.",
 };
+
+/** Minimum gap between access checks while the socket keeps failing. */
+const ACCESS_CHECK_INTERVAL_MS = 10_000;
 
 function globToRegExp(pattern: string) {
   // Very small glob: * => any chars, ? => single char
@@ -298,6 +302,7 @@ export function CollabProvider({
   userId,
   token,
   onLeave,
+  checkAccess,
 }: {
   children: React.ReactNode;
   room: RoomInfo;
@@ -307,6 +312,11 @@ export function CollabProvider({
   token: string;
   /** Called when the user dismisses a fatal connection error. */
   onLeave?: () => void;
+  /**
+   * Asked while the socket can't connect. Resolve false if the user is no
+   * longer a member (room deleted or left elsewhere) so we stop retrying.
+   */
+  checkAccess?: () => Promise<boolean>;
 }) {
   const roomId = room.id;
   const [session, setSession] = useState<Session | null>(null);
@@ -315,6 +325,11 @@ export function CollabProvider({
   const [lastError, setLastError] = useState<string | null>(null);
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [synced, setSynced] = useState(false);
+  // Brief "back online" message after a reconnect has resynced (FR-5 / 2.3).
+  const [notice, setNotice] = useState<string | null>(null);
+  const checkAccessRef = useRef(checkAccess);
+  checkAccessRef.current = checkAccess;
+  const [roomName, setRoomName] = useState<string | null>(null);
   // Bumped on awareness changes so the member list stays live.
   const [awarenessTick, setAwarenessTick] = useState(0);
   const [defaultRole, setDefaultRoleSnap] = useState<"viewer" | "editor">("viewer");
@@ -363,6 +378,11 @@ export function CollabProvider({
 
   useEffect(() => {
     let alive = true;
+    // Only announce "back online" after a drop that followed a successful sync.
+    let everSynced = false;
+    let wasOffline = false;
+    let lastAccessCheck = 0;
+    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
     const doc = new Y.Doc();
     const provider = new YProvider(server.host, roomId, doc, {
@@ -393,17 +413,43 @@ export function CollabProvider({
       const next = normalizeStatus(ev?.status);
       setStatus(next);
       if (next === "connected") setLastError(null);
+      if (next === "disconnected" && everSynced) wasOffline = true;
     };
     provider.on("status", onStatus);
 
     const onSync = (isSynced: boolean) => {
-      if (alive) setSynced(!!isSynced);
+      if (!alive) return;
+      setSynced(!!isSynced);
+      if (isSynced) everSynced = true;
+      if (isSynced && wasOffline) {
+        wasOffline = false;
+        setNotice("Back online. Your changes are synced.");
+        clearTimeout(noticeTimer);
+        noticeTimer = setTimeout(() => alive && setNotice(null), 3500);
+      }
     };
     provider.on("sync", onSync);
 
     const onConnError = () => {
       if (!alive) return;
+      if (everSynced) wasOffline = true;
       setLastError("Can't reach the collaboration server. Retrying…");
+
+      // A refused handshake (403: room deleted / no longer a member) looks the
+      // same as a network error here, so ask the API before retrying forever.
+      const check = checkAccessRef.current;
+      const now = Date.now();
+      if (!check || now - lastAccessCheck < ACCESS_CHECK_INTERVAL_MS) return;
+      lastAccessCheck = now;
+      check()
+        .then((ok) => {
+          if (!alive || ok) return;
+          setFatalError("This room no longer exists, or you're no longer a member of it.");
+          provider.disconnect();
+        })
+        .catch(() => {
+          // offline or API down: keep retrying
+        });
     };
     const onConnClose = (e: any) => {
       if (!alive) return;
@@ -413,6 +459,7 @@ export function CollabProvider({
         provider.disconnect();
         return;
       }
+      if (everSynced) wasOffline = true;
       setStatus("disconnected");
       setLastError(`Connection lost (${stringifyReason(e)}). Reconnecting…`);
     };
@@ -432,6 +479,12 @@ export function CollabProvider({
 
     // Observe Yjs for snapshots
     const updateHost = () => {
+      if (roomMeta.get("deleted") === true) {
+        setFatalError(FATAL_CLOSE_REASONS["room-deleted"]);
+        provider.disconnect();
+        return;
+      }
+      setRoomName(String(roomMeta.get("name") ?? "") || null);
       setHostId(String(roomMeta.get("hostId") ?? "") || null);
       setDefaultRoleSnap(roomMeta.get("defaultRole") === "editor" ? "editor" : "viewer");
       const dfId = String(roomMeta.get("driveFolderId") ?? "");
@@ -513,6 +566,7 @@ export function CollabProvider({
     setLastError(null);
     setFatalError(null);
     setSynced(false);
+    setNotice(null);
 
     return () => {
       alive = false;
@@ -535,12 +589,19 @@ export function CollabProvider({
       editReqArr.unobserve(updateEditRequests);
       termReqArr.unobserve(updateTerminalRequests);
 
+      clearTimeout(noticeTimer);
       detachStyles?.();
       provider.destroy();
       doc.destroy();
       setSession(null);
     };
   }, [server, roomId, token]);
+
+  // The host can rename the room; the server pushes the new name into room:meta.
+  const liveRoom = useMemo(
+    () => (roomName && roomName !== room.name ? { ...room, name: roomName } : room),
+    [room, roomName]
+  );
 
   const me = meRef.current;
   const isHost = hostId === me.userId;
@@ -836,7 +897,7 @@ export function CollabProvider({
     };
 
     return {
-      room,
+      room: liveRoom,
       roomId,
 
       doc: session.doc,
@@ -884,7 +945,7 @@ export function CollabProvider({
     };
   }, [
     session,
-    room,
+    liveRoom,
     roomId,
     status,
     lastError,
@@ -941,30 +1002,34 @@ export function CollabProvider({
   return (
     <CollabContext.Provider value={value}>
       {lastError && status !== "connected" && (
-        <div
-          role="status"
-          style={{
-            position: "fixed",
-            left: "50%",
-            bottom: 16,
-            transform: "translateX(-50%)",
-            zIndex: 10000,
-            padding: "8px 14px",
-            borderRadius: 8,
-            background: "#111827",
-            color: "#fff",
-            fontSize: 13,
-            fontFamily: "system-ui",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.2)",
-          }}
-        >
+        <div role="status" style={toastStyle}>
           {lastError}
+        </div>
+      )}
+      {notice && !(lastError && status !== "connected") && (
+        <div role="status" style={toastStyle}>
+          {notice}
         </div>
       )}
       {children}
     </CollabContext.Provider>
   );
 }
+
+const toastStyle: React.CSSProperties = {
+  position: "fixed",
+  left: "50%",
+  bottom: 16,
+  transform: "translateX(-50%)",
+  zIndex: 10000,
+  padding: "8px 14px",
+  borderRadius: 8,
+  background: "#111827",
+  color: "#fff",
+  fontSize: 13,
+  fontFamily: "system-ui",
+  boxShadow: "0 8px 24px rgba(0,0,0,0.2)",
+};
 
 export function useCollab() {
   const ctx = useContext(CollabContext);

@@ -50,6 +50,9 @@ type AuthResponse = {
   user?: User;
 };
 
+// Set by AuthProvider: signs the user out when the API rejects their token.
+let onUnauthorized: (() => void) | null = null;
+
 async function requestJson<T>(
   path: string,
   opts: RequestInit & { token?: string | null } = {}
@@ -66,6 +69,8 @@ async function requestJson<T>(
     ...opts,
     headers,
   });
+
+  if (res.status === 401 && opts.token) onUnauthorized?.();
 
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
@@ -110,7 +115,26 @@ const api = {
     }),
   leaveRoom: (token: string, roomId: string) =>
     requestJson<{ ok: boolean }>(`/api/rooms/${encodeURIComponent(roomId)}/leave/`, { method: "POST", token }),
+  renameRoom: (token: string, roomId: string, name: string) =>
+    requestJson<ApiRoom>(`/api/rooms/${encodeURIComponent(roomId)}/`, {
+      method: "PATCH",
+      token,
+      body: JSON.stringify({ name }),
+    }),
+  deleteRoom: (token: string, roomId: string) =>
+    requestJson<{ ok: boolean }>(`/api/rooms/${encodeURIComponent(roomId)}/`, { method: "DELETE", token }),
 };
+
+/** Expiry time (ms) from a JWT's `exp` claim, or null if it can't be read. */
+function tokenExpiry(token: string): number | null {
+  try {
+    const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const exp = JSON.parse(atob(part)).exp;
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
 
 function toRoomInfo(r: ApiRoom): RoomInfo {
   return { id: r.id, name: r.name, joinCode: r.join_code, maxUsers: r.max_users };
@@ -127,6 +151,8 @@ type AuthContextValue = {
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => void;
+  /** Why the user was signed out automatically (shown on the login page). */
+  notice: string | null;
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -138,6 +164,37 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   );
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const expire = useCallback(() => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken(null);
+    setUser(null);
+    setNotice("Your session has expired. Please sign in again.");
+  }, []);
+
+  // Any 401 from the API means the token is no longer valid.
+  useEffect(() => {
+    onUnauthorized = expire;
+    return () => {
+      onUnauthorized = null;
+    };
+  }, [expire]);
+
+  // Sign out when the token expires, even if no request is made.
+  useEffect(() => {
+    if (!token) return;
+    const exp = tokenExpiry(token);
+    if (exp === null) return;
+    const ms = exp - Date.now();
+    if (ms <= 0) {
+      expire();
+      return;
+    }
+    // setTimeout overflows above ~24.8 days; tokens last 7.
+    const t = setTimeout(expire, Math.min(ms, 2 ** 31 - 1));
+    return () => clearTimeout(t);
+  }, [token, expire]);
 
   useEffect(() => {
     let cancelled = false;
@@ -171,6 +228,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   async function login(email: string, password: string) {
     const res = await api.login(email.trim(), password);
     localStorage.setItem(TOKEN_KEY, res.access);
+    setNotice(null);
     setToken(res.access);
     if (res.user) setUser(res.user);
   }
@@ -189,8 +247,8 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   const value = useMemo<AuthContextValue>(
-    () => ({ token, user, loading, login, register, logout }),
-    [token, user, loading]
+    () => ({ token, user, loading, login, register, logout, notice }),
+    [token, user, loading, notice]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -265,7 +323,7 @@ function PrimaryButton(
 ========================= */
 
 function LoginPage() {
-  const { login } = useAuth();
+  const { login, notice } = useAuth();
   const nav = useNavigate();
   const location = useLocation() as any;
 
@@ -302,6 +360,7 @@ function LoginPage() {
     >
       <h1 style={{ margin: 0, marginBottom: 16 }}>Login</h1>
 
+      {notice && !err && <div style={{ marginBottom: 12, color: "#92400e" }}>{notice}</div>}
       {err && <div style={{ marginBottom: 12, color: "#b91c1c" }}>{err}</div>}
 
       <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
@@ -473,12 +532,15 @@ const darkBtn: React.CSSProperties = {
 function RoomsPanel({
   currentRoomId,
   onSelect,
+  onRemoved,
 }: {
   currentRoomId?: string;
   onSelect: (room: RoomInfo) => void;
+  /** Called after the user leaves or deletes a room. */
+  onRemoved?: (roomId: string) => void;
 }) {
-  const { token } = useAuth();
-  const [rooms, setRooms] = useState<RoomInfo[] | null>(null);
+  const { token, user } = useAuth();
+  const [rooms, setRooms] = useState<ApiRoom[] | null>(null);
   const [roomName, setRoomName] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -488,7 +550,7 @@ function RoomsPanel({
     if (!token) return;
     try {
       const res = await api.listRooms(token);
-      setRooms(res.rooms.map(toRoomInfo));
+      setRooms(res.rooms);
     } catch (e: any) {
       setErr(e?.message ?? "Couldn't load rooms.");
       setRooms([]);
@@ -511,14 +573,45 @@ function RoomsPanel({
     }
   }
 
-  async function leave(room: RoomInfo) {
+  async function leave(room: ApiRoom) {
     if (!token) return;
-    if (!window.confirm(`Leave "${room.name}"? You can rejoin with its code (${room.joinCode}).`)) return;
+    if (!window.confirm(`Leave "${room.name}"? You can rejoin with its code (${room.join_code}).`)) return;
     try {
       await api.leaveRoom(token, room.id);
+      onRemoved?.(room.id);
       await refresh();
     } catch (e: any) {
       setErr(e?.message ?? "Couldn't leave room.");
+    }
+  }
+
+  async function rename(room: ApiRoom) {
+    if (!token) return;
+    const next = window.prompt("New room name", room.name)?.trim();
+    if (!next || next === room.name) return;
+    if (next.length < 2) return setErr("Room name must be at least 2 characters.");
+    setErr(null);
+    try {
+      await api.renameRoom(token, room.id, next);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ?? "Couldn't rename room.");
+    }
+  }
+
+  async function remove(room: ApiRoom) {
+    if (!token) return;
+    const ok = window.confirm(
+      `Delete "${room.name}" for everyone?\n\nAll of its files and chat will be permanently deleted. This can't be undone.`
+    );
+    if (!ok) return;
+    setErr(null);
+    try {
+      await api.deleteRoom(token, room.id);
+      onRemoved?.(room.id);
+      await refresh();
+    } catch (e: any) {
+      setErr(e?.message ?? "Couldn't delete room.");
     }
   }
 
@@ -573,37 +666,56 @@ function RoomsPanel({
           <div style={{ opacity: 0.7 }}>No rooms yet. Create one or join with a code.</div>
         ) : (
           <div style={{ display: "grid", gap: 6 }}>
-            {rooms.map((r) => (
-              <div
-                key={r.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "8px 10px",
-                  border: "1px solid #e5e7eb",
-                  borderRadius: 8,
-                  background: r.id === currentRoomId ? "#f3f4f6" : "#fff",
-                }}
-              >
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</div>
-                  <div style={{ fontSize: 12, opacity: 0.7, fontFamily: "ui-monospace, monospace" }}>
-                    {r.joinCode}
+            {rooms.map((r) => {
+              const owned = !!user && r.created_by === String(user.id);
+              return (
+                <div
+                  key={r.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "8px 10px",
+                    border: "1px solid #e5e7eb",
+                    borderRadius: 8,
+                    background: r.id === currentRoomId ? "#f3f4f6" : "#fff",
+                  }}
+                >
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</div>
+                    <div style={{ fontSize: 12, opacity: 0.7, fontFamily: "ui-monospace, monospace" }}>
+                      {r.join_code}
+                      {owned && " · host"}
+                    </div>
                   </div>
+                  {r.id === currentRoomId ? (
+                    <span style={{ fontSize: 12, opacity: 0.7 }}>current</span>
+                  ) : (
+                    <button onClick={() => onSelect(toRoomInfo(r))} style={smallBtn}>
+                      Open
+                    </button>
+                  )}
+                  {owned ? (
+                    <>
+                      <button onClick={() => void rename(r)} style={smallBtn} title="Rename room">
+                        Rename
+                      </button>
+                      <button
+                        onClick={() => void remove(r)}
+                        style={{ ...smallBtn, color: "#b91c1c", borderColor: "#fca5a5" }}
+                        title="Delete room for everyone"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  ) : (
+                    <button onClick={() => void leave(r)} style={smallBtn} title="Leave room">
+                      Leave
+                    </button>
+                  )}
                 </div>
-                {r.id === currentRoomId ? (
-                  <span style={{ fontSize: 12, opacity: 0.7 }}>current</span>
-                ) : (
-                  <button onClick={() => onSelect(r)} style={smallBtn}>
-                    Open
-                  </button>
-                )}
-                <button onClick={() => void leave(r)} style={smallBtn} title="Leave room">
-                  Leave
-                </button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -632,11 +744,13 @@ function RoomDialog({
   onClose,
   currentRoomId,
   onSelect,
+  onRemoved,
 }: {
   open: boolean;
   onClose: () => void;
   currentRoomId: string;
   onSelect: (room: RoomInfo) => void;
+  onRemoved: (roomId: string) => void;
 }) {
   if (!open) return null;
   return (
@@ -677,6 +791,10 @@ function RoomDialog({
             onSelect(r);
             onClose();
           }}
+          onRemoved={(id) => {
+            if (id === currentRoomId) onClose();
+            onRemoved(id);
+          }}
         />
       </div>
     </div>
@@ -714,7 +832,13 @@ function RoomBar({ onOpenRoomDialog }: { onOpenRoomDialog: () => void }) {
    Main protected app UI
 ========================= */
 
-function AppShell({ onSelectRoom }: { onSelectRoom: (room: RoomInfo) => void }) {
+function AppShell({
+  onSelectRoom,
+  onRoomRemoved,
+}: {
+  onSelectRoom: (room: RoomInfo) => void;
+  onRoomRemoved: (roomId: string) => void;
+}) {
   const { user, logout } = useAuth();
   const { doc, room, synced } = useCollab();
 
@@ -826,6 +950,7 @@ function AppShell({ onSelectRoom }: { onSelectRoom: (room: RoomInfo) => void }) 
         onClose={() => setRoomDialogOpen(false)}
         currentRoomId={room.id}
         onSelect={onSelectRoom}
+        onRemoved={onRoomRemoved}
       />
     </div>
   );
@@ -848,6 +973,20 @@ function CollabWrapper() {
     [userId]
   );
 
+  // Leaving or deleting the open room drops you back to the lobby.
+  const roomRemoved = useCallback(
+    (roomId: string) => {
+      if (room?.id === roomId) selectRoom(null);
+    },
+    [room, selectRoom]
+  );
+
+  const checkAccess = useCallback(async () => {
+    if (!token || !room) return true;
+    const res = await api.listRooms(token);
+    return res.rooms.some((r) => r.id === room.id);
+  }, [token, room]);
+
   if (!user || !token) return <div style={{ padding: 24 }}>Loading...</div>;
   if (!room) return <RoomLobby onSelect={selectRoom} />;
 
@@ -859,8 +998,9 @@ function CollabWrapper() {
       userId={userId}
       displayName={user.username ?? user.email.split("@")[0]}
       onLeave={() => selectRoom(null)}
+      checkAccess={checkAccess}
     >
-      <AppShell onSelectRoom={selectRoom} />
+      <AppShell onSelectRoom={selectRoom} onRoomRemoved={roomRemoved} />
     </CollabProvider>
   );
 }

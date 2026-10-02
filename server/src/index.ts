@@ -1,12 +1,13 @@
 import { Hono, type Context } from "hono";
-import { routePartykitRequest } from "partyserver";
+import { getServerByName, routePartykitRequest } from "partyserver";
 import { hashPassword, signToken, verifyPassword, verifyToken, type TokenClaims } from "./auth";
+import type { Room } from "./room";
 
 export { Room } from "./room";
 
 export interface Env {
   DB: D1Database;
-  Room: DurableObjectNamespace;
+  Room: DurableObjectNamespace<Room>;
   JWT_SECRET: string;
 }
 
@@ -221,6 +222,58 @@ app.post("/api/rooms/:id/leave", async (c) => {
   await c.env.DB.prepare("DELETE FROM room_members WHERE room_id = ? AND user_id = ?")
     .bind(c.req.param("id"), c.get("user").sub)
     .run();
+  return c.json({ ok: true });
+});
+
+/** Loads a room the caller created; returns an error response otherwise. */
+async function hostedRoom(c: AppContext) {
+  const room = await c.env.DB.prepare("SELECT * FROM rooms WHERE id = ?").bind(c.req.param("id")).first<RoomRow>();
+  if (!room) return { error: c.json({ detail: "Room not found." }, 404) };
+  if (room.created_by !== c.get("user").sub) {
+    return { error: c.json({ detail: "Only the room's host can do that." }, 403) };
+  }
+  return { room };
+}
+
+app.patch("/api/rooms/:id", async (c) => {
+  const body = await c.req.json<{ name?: string }>().catch(() => ({}) as any);
+  const name = String(body.name ?? "").trim().slice(0, 80);
+  if (name.length < 2) return c.json({ message: "Room name must be at least 2 characters." }, 400);
+
+  const { room, error } = await hostedRoom(c);
+  if (error) return error;
+
+  await c.env.DB.prepare("UPDATE rooms SET name = ? WHERE id = ?").bind(name, room.id).run();
+
+  // Push the new name to everyone connected so their room bar updates live.
+  try {
+    const stub = await getServerByName(c.env.Room, room.id);
+    await stub.rename(name);
+  } catch (e) {
+    console.error("room rename broadcast failed", e);
+  }
+
+  return c.json(roomPayload({ ...room, name }));
+});
+
+app.delete("/api/rooms/:id", async (c) => {
+  const { room, error } = await hostedRoom(c);
+  if (error) return error;
+
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM room_members WHERE room_id = ?").bind(room.id),
+    c.env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(room.id),
+  ]);
+
+  // Membership is gone, so nobody can reconnect; now kick live sockets and
+  // wipe the stored document.
+  try {
+    const stub = await getServerByName(c.env.Room, room.id);
+    await stub.destroy();
+  } catch (e) {
+    console.error("room destroy failed", e);
+  }
+
   return c.json({ ok: true });
 });
 
