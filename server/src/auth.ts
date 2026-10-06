@@ -59,12 +59,12 @@ function secretKey(secret: string) {
   return new TextEncoder().encode(secret);
 }
 
-export async function signToken(claims: TokenClaims, secret: string) {
+export async function signToken(claims: TokenClaims, secret: string, ttl = TOKEN_TTL) {
   return new SignJWT({ email: claims.email })
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(claims.sub)
     .setIssuedAt()
-    .setExpirationTime(TOKEN_TTL)
+    .setExpirationTime(ttl)
     .sign(secretKey(secret));
 }
 

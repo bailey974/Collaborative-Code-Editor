@@ -7,3 +7,7 @@
 #
 # Use a long random string. Any value works for local development.
 JWT_SECRET=dev-only-secret-change-me
+
+# Optional: Google Drive config for local dev (public values, see README).
+# GOOGLE_CLIENT_ID=
+# GOOGLE_API_KEY=

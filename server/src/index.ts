@@ -9,6 +9,9 @@ export interface Env {
   DB: D1Database;
   Room: DurableObjectNamespace<Room>;
   JWT_SECRET: string;
+  /** Public Google Drive config (an OAuth client id and a browser API key). */
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_API_KEY?: string;
 }
 
 type Vars = { user: TokenClaims };
@@ -30,6 +33,11 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const RATE_MAX = 20;
+
+// Guest accounts: no password, short-lived token, swept by the daily cron.
+const GUEST_DOMAIN = "guest.invalid";
+const GUEST_TTL = "1d";
+const GUEST_MAX_AGE_MS = 2 * 24 * 60 * 60 * 1000;
 
 function generateJoinCode() {
   const bytes = crypto.getRandomValues(new Uint8Array(JOIN_LEN));
@@ -82,6 +90,15 @@ app.onError((err, c) => {
 
 app.get("/api/healthz", (c) => c.json({ ok: true }));
 
+// Public runtime config for the client. Read at page load, so changing these
+// Worker vars takes effect on the next deploy without rebuilding web/.
+app.get("/api/config", (c) =>
+  c.json({
+    googleClientId: c.env.GOOGLE_CLIENT_ID?.trim() ?? "",
+    googleApiKey: c.env.GOOGLE_API_KEY?.trim() ?? "",
+  })
+);
+
 /* ---------- auth ---------- */
 
 async function readCredentials(c: AppContext) {
@@ -91,8 +108,8 @@ async function readCredentials(c: AppContext) {
   return { email, password };
 }
 
-async function issue(c: AppContext, user: { id: string; email: string }) {
-  const access = await signToken({ sub: user.id, email: user.email }, c.env.JWT_SECRET);
+async function issue(c: AppContext, user: { id: string; email: string }, ttl?: string) {
+  const access = await signToken({ sub: user.id, email: user.email }, c.env.JWT_SECRET, ttl);
   return c.json({ access, user: publicUser(user) });
 }
 
@@ -105,6 +122,7 @@ app.post("/api/auth/register", async (c) => {
   const { email, password } = await readCredentials(c);
   if (!email || !password) return c.json({ message: "Email and password required." }, 400);
   if (!EMAIL_RE.test(email)) return c.json({ message: "Enter a valid email address." }, 400);
+  if (email.endsWith(`@${GUEST_DOMAIN}`)) return c.json({ message: "That email domain is reserved." }, 400);
   if (password.length < 8) return c.json({ message: "Password must be at least 8 characters." }, 400);
 
   const existing = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
@@ -133,6 +151,23 @@ app.post("/api/auth/login", async (c) => {
     return c.json({ message: "Invalid email or password." }, 401);
   }
   return issue(c, user);
+});
+
+// One-click demo account. The stored hash isn't a valid pbkdf2 string, so
+// nobody can ever log in to it with a password.
+app.post("/api/auth/guest", async (c) => {
+  const ip = c.req.header("CF-Connecting-IP") ?? "local";
+  if (await rateLimited(c.env.DB, `guest:${ip}`)) {
+    return c.json({ message: "Too many guest sessions. Try again in a few minutes." }, 429);
+  }
+
+  const tag = crypto.randomUUID().slice(0, 6);
+  const user = { id: crypto.randomUUID(), email: `guest-${tag}@${GUEST_DOMAIN}` };
+  await c.env.DB.prepare("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
+    .bind(user.id, user.email, "guest", Date.now())
+    .run();
+
+  return issue(c, user, GUEST_TTL);
 });
 
 /* ---------- authenticated routes ---------- */
@@ -312,7 +347,39 @@ async function authorizeSocket(request: Request, env: Env, roomId: string) {
   return new Request(request, { headers });
 }
 
+/** Deletes guest accounts (and the rooms they host) once their tokens are long expired. */
+async function sweepGuests(env: Env) {
+  const cutoff = Date.now() - GUEST_MAX_AGE_MS;
+  const { results: rooms } = await env.DB.prepare(
+    `SELECT r.id FROM rooms r JOIN users u ON u.id = r.created_by
+     WHERE u.email LIKE ?1 AND u.created_at < ?2`
+  )
+    .bind(`%@${GUEST_DOMAIN}`, cutoff)
+    .all<{ id: string }>();
+
+  for (const { id } of rooms) {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM room_members WHERE room_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(id),
+    ]);
+    try {
+      const stub = await getServerByName(env.Room, id);
+      await stub.destroy();
+    } catch (e) {
+      console.error("guest room destroy failed", id, e);
+    }
+  }
+
+  await env.DB.prepare("DELETE FROM users WHERE email LIKE ?1 AND created_at < ?2")
+    .bind(`%@${GUEST_DOMAIN}`, cutoff)
+    .run();
+}
+
 export default {
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(sweepGuests(env));
+  },
+
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 

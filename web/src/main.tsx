@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import "./monacoSetup";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { loadDriveConfig } from "./drive/googleDrive";
 
 // Show *something* immediately
 document.body.style.margin = "0";
@@ -18,6 +19,9 @@ if (!el) {
     `</pre>`;
   throw new Error("Root element #root not found");
 }
+
+// Fetch runtime config first so the Drive buttons are right on first render.
+await loadDriveConfig();
 
 try {
   ReactDOM.createRoot(el).render(

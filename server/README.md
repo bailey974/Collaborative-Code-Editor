@@ -87,6 +87,42 @@ cd ../server && npm run deploy
 That single URL serves the site, the API and the collaboration sockets. To use a
 custom domain, add a route in the Cloudflare dashboard — no code change needed.
 
+## Guest accounts
+
+`POST /api/auth/guest` creates a throwaway account (`guest-xxxxxx@guest.invalid`,
+no usable password) and returns a 1-day token, so visitors can try the app
+without signing up. A daily Cron Trigger (`triggers.crons` in `wrangler.jsonc`,
+free plan) deletes guests older than 2 days along with the rooms they host
+(D1 rows and each room's Durable Object storage). Guest sign-ups are rate
+limited per IP, and nobody can register an `@guest.invalid` email.
+
+## Google Drive setup (free, optional)
+
+Drive import/save runs entirely in the browser (the `drive.file` scope plus the
+Google Picker), so the Worker only hands out two **public** values from
+`GET /api/config`: an OAuth client id and a browser API key. They are not
+secrets, so they live in `wrangler.jsonc` `vars` and ship with every deploy (CI
+or manual) without a rebuild. While they're empty the Drive buttons are hidden.
+
+Neither Google API costs anything and no billing account is needed:
+
+1. https://console.cloud.google.com → create a project (skip billing).
+2. **APIs & Services → Library**: enable **Google Drive API** and **Google Picker API**.
+3. **Google Auth Platform → Branding**: app name + support email.
+   **Audience**: External, then **Publish app** (In production). The app only
+   asks for `drive.file`, a non-sensitive scope, so publishing needs no Google
+   verification and anyone can sign in (Testing mode limits you to listed test
+   users).
+4. **Clients → Create client → Web application**. Authorised JavaScript origins:
+   `https://collab-code-editor.<account>.workers.dev`, plus `http://127.0.0.1:1420`
+   and `http://127.0.0.1:8787` for local dev. Copy the client id.
+5. **APIs & Services → Credentials → Create credentials → API key**. Restrict it:
+   *Websites* → `https://collab-code-editor.<account>.workers.dev/*` (and the
+   local origins), *API restrictions* → Google Picker API. Then a copied key is
+   useless on any other site.
+6. Paste both into `wrangler.jsonc` → `vars.GOOGLE_CLIENT_ID` / `GOOGLE_API_KEY`,
+   commit, deploy. For local dev you can put the same two lines in `.dev.vars`.
+
 ## How auth reaches the collaboration layer
 
 1. Client logs in via `/api/auth/*` and stores the returned JWT.
@@ -109,6 +145,8 @@ Verified handshake behaviour: valid member → `101` upgrade; missing/bad token 
 | `DB` | `wrangler.jsonc` d1_databases | Users, rooms, membership, rate limits |
 | `Room` | `wrangler.jsonc` durable_objects | One collaboration doc per room |
 | `JWT_SECRET` | `.dev.vars` locally / `wrangler secret` in prod | Signs & verifies auth tokens |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_API_KEY` | `wrangler.jsonc` vars (public) | Served by `/api/config`; enables Google Drive |
+| `triggers.crons` | `wrangler.jsonc` | Daily guest-account cleanup |
 | `assets.directory` | `wrangler.jsonc` | Points at `../web/dist` (build first) |
 
 ## Scripts

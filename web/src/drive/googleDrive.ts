@@ -10,16 +10,35 @@
  * the app access only to the folder the user explicitly chose (and its
  * contents), so we never request the broad, verification-gated Drive scopes.
  *
- * Config comes from Vite env (public, no secrets — an OAuth Client ID and a
- * browser API key):
- *   VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_API_KEY
- * When either is missing, isConfigured() is false and the UI stays disabled.
+ * Config is public (no secrets — an OAuth Client ID and a browser API key).
+ * It's fetched at startup from the Worker's GET /api/config (the
+ * GOOGLE_CLIENT_ID / GOOGLE_API_KEY vars in server/wrangler.jsonc), so a
+ * deploy never needs them at build time. VITE_GOOGLE_CLIENT_ID /
+ * VITE_GOOGLE_API_KEY still work as a build-time fallback.
+ * When either is missing, isDriveConfigured() is false and the UI stays hidden.
  */
 
 import { looksBinary, MAX_FILE_BYTES, normalizePath } from "../collab/yFiles";
 
-const CLIENT_ID = String(import.meta.env.VITE_GOOGLE_CLIENT_ID ?? "").trim();
-const API_KEY = String(import.meta.env.VITE_GOOGLE_API_KEY ?? "").trim();
+let CLIENT_ID = String(import.meta.env.VITE_GOOGLE_CLIENT_ID ?? "").trim();
+let API_KEY = String(import.meta.env.VITE_GOOGLE_API_KEY ?? "").trim();
+
+const API_BASE = (import.meta.env.VITE_API_BASE_URL?.toString() ?? "").replace(/\/+$/, "");
+
+/** Loads the Drive config from the Worker. Never throws; gives up after 3s. */
+export async function loadDriveConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/config`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return;
+    const cfg = (await res.json()) as { googleClientId?: string; googleApiKey?: string };
+    if (cfg.googleClientId && cfg.googleApiKey) {
+      CLIENT_ID = cfg.googleClientId;
+      API_KEY = cfg.googleApiKey;
+    }
+  } catch {
+    // offline or old Worker: keep the build-time values
+  }
+}
 
 // drive.file: app only sees files it created or the user picked. Enough for
 // importing/pushing a folder chosen via the Picker, and avoids app verification.

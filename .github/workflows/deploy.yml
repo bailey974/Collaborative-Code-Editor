@@ -4,10 +4,8 @@ name: Deploy to Cloudflare
 # Requires these repository secrets (Settings > Secrets and variables > Actions):
 #   CLOUDFLARE_API_TOKEN   - a token with "Edit Cloudflare Workers" permission
 #   CLOUDFLARE_ACCOUNT_ID  - d33f00e398dfde4d8ad88ddf72425a05
-#   VITE_GOOGLE_CLIENT_ID  - (optional) enables the Drive buttons in the build
-#   VITE_GOOGLE_API_KEY    - (optional) required by the Google Picker
-# Without the two VITE_GOOGLE_* secrets the site still deploys; the Drive
-# buttons just stay hidden. JWT_SECRET is already stored in the Worker and is
+# Google Drive config is public and lives in server/wrangler.jsonc "vars", so
+# it needs no secret here. JWT_SECRET is already stored in the Worker and is
 # not touched by a deploy.
 
 on:
@@ -30,9 +28,6 @@ jobs:
         run: |
           npm ci
           npm run build
-        env:
-          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
-          VITE_GOOGLE_API_KEY: ${{ secrets.VITE_GOOGLE_API_KEY }}
 
       - name: Install server dependencies
         working-directory: server

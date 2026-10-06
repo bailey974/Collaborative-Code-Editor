@@ -99,6 +99,7 @@ const api = {
       method: "POST",
       body: JSON.stringify({ email, password }),
     }),
+  guest: () => requestJson<AuthResponse>("/api/auth/guest/", { method: "POST" }),
   me: (token: string) =>
     requestJson<User>("/api/auth/me/", {
       method: "GET",
@@ -150,6 +151,8 @@ type AuthContextValue = {
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
+  /** Signs in as a throwaway guest account (no sign-up needed). */
+  guest: () => Promise<void>;
   logout: () => void;
   /** Why the user was signed out automatically (shown on the login page). */
   notice: string | null;
@@ -240,6 +243,14 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (res.user) setUser(res.user);
   }
 
+  async function guest() {
+    const res = await api.guest();
+    localStorage.setItem(TOKEN_KEY, res.access);
+    setNotice(null);
+    setToken(res.access);
+    if (res.user) setUser(res.user);
+  }
+
   function logout() {
     localStorage.removeItem(TOKEN_KEY);
     setToken(null);
@@ -247,7 +258,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   const value = useMemo<AuthContextValue>(
-    () => ({ token, user, loading, login, register, logout, notice }),
+    () => ({ token, user, loading, login, register, guest, logout, notice }),
     [token, user, loading, notice]
   );
 
@@ -323,7 +334,7 @@ function PrimaryButton(
 ========================= */
 
 function LoginPage() {
-  const { login, notice } = useAuth();
+  const { login, guest, notice } = useAuth();
   const nav = useNavigate();
   const location = useLocation() as any;
 
@@ -343,6 +354,19 @@ function LoginPage() {
       nav(dest, { replace: true });
     } catch (ex: any) {
       setErr(ex?.message ?? "Login failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onGuest() {
+    setErr(null);
+    setBusy(true);
+    try {
+      await guest();
+      nav(location?.state?.from ?? "/", { replace: true });
+    } catch (ex: any) {
+      setErr(ex?.message ?? "Could not start a guest session");
     } finally {
       setBusy(false);
     }
@@ -387,6 +411,22 @@ function LoginPage() {
           {busy ? "Signing in..." : "Sign in"}
         </PrimaryButton>
       </form>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "16px 0", color: "#6b7280", fontSize: 13 }}>
+        <div style={{ flex: 1, borderTop: "1px solid #e5e7eb" }} />
+        or
+        <div style={{ flex: 1, borderTop: "1px solid #e5e7eb" }} />
+      </div>
+
+      <div style={{ display: "grid" }}>
+        <PrimaryButton disabled={busy} type="button" onClick={onGuest}>
+          Try it as a guest
+        </PrimaryButton>
+      </div>
+      <div style={{ marginTop: 8, fontSize: 12, color: "#6b7280" }}>
+        No sign-up. Guest accounts and their rooms are deleted after 2 days.
+        Tip: open the room in a second tab or window to see live collaboration.
+      </div>
 
       <div style={{ marginTop: 14 }}>
         No account? <Link to="/register">Create one</Link>

@@ -30,5 +30,17 @@
   // Free plan requires SQLite-backed Durable Objects.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
 
+  // Public Google Drive config, served to the browser by GET /api/config.
+  // Neither value is a secret: an OAuth *client id* and a browser API key that
+  // is locked to this site's origin and the Picker API (see web/.env.example).
+  // Leave empty to hide the Drive buttons.
+  "vars": {
+    "GOOGLE_CLIENT_ID": "",
+    "GOOGLE_API_KEY": ""
+  },
+
+  // Daily sweep of expired guest accounts and the rooms they host.
+  "triggers": { "crons": ["17 3 * * *"] },
+
   "observability": { "enabled": true }
 }
