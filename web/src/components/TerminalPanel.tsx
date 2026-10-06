@@ -4,14 +4,19 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useCollab } from "../collab/CollabProvider";
-import { getFilesMap, normalizePath } from "../collab/yFiles";
+import { getDirsMap, getFilesMap } from "../collab/yFiles";
 import { RUN_EVENT, isRunnable } from "../runner/runEvents";
 import { runInBrowser, type OutputStream, type RunHandle } from "../runner/runCode";
+import { HELP_TEXT, commandFor, listDir, parseCommand } from "../runner/shell";
 
 /*
- * Shared output console. Code runs in the browser of whoever presses Run
- * (see src/runner); their output is appended to a shared Y.Text so everyone
- * in the room sees the same console.
+ * Shared terminal. Commands run in the browser of whoever types them (see
+ * src/runner). A program's command line, output and anything typed into it
+ * are appended to a shared Y.Text so everyone in the room sees the same
+ * session; ls, cat, help and clear only affect your own screen.
+ *
+ * The line being typed is drawn locally after the shared log. When the log
+ * grows, that line is erased, the new output written, and the line redrawn.
  */
 
 type Props = { activePath?: string };
@@ -25,9 +30,10 @@ const ANSI = {
   dim: "\x1b[2m",
   red: "\x1b[31m",
   green: "\x1b[32m",
-  yellow: "\x1b[33m",
-  cyan: "\x1b[36m",
 };
+
+// Lets backspace move up across soft-wrapped lines, so a long typed line can be erased.
+const REVERSE_WRAPAROUND = "\x1b[?45h";
 
 const toolbarBtn = (enabled: boolean): CSSProperties => ({
   padding: "4px 10px",
@@ -38,6 +44,25 @@ const toolbarBtn = (enabled: boolean): CSSProperties => ({
   cursor: enabled ? "pointer" : "not-allowed",
   fontSize: 12,
 });
+
+/** What's being typed, kept across renders. */
+type LineState = {
+  input: string;
+  history: string[];
+  historyIndex: number;
+  /** True while this browser runs a program: typed lines go to its input(). */
+  running: boolean;
+};
+
+type Screen = {
+  /** Erases and redraws the line being typed. */
+  redraw: () => void;
+  /** Writes output that only this user sees, above the line being typed. */
+  print: (text: string) => void;
+  /** Clears this user's screen (the shared log is untouched). */
+  clear: () => void;
+  focus: () => void;
+};
 
 export default function TerminalPanel({ activePath }: Props) {
   const {
@@ -54,8 +79,9 @@ export default function TerminalPanel({ activePath }: Props) {
   } = useCollab();
 
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const termRef = useRef<Terminal | null>(null);
   const runRef = useRef<RunHandle | null>(null);
+  const screenRef = useRef<Screen | null>(null);
+  const lineRef = useRef<LineState>({ input: "", history: [], historyIndex: 0, running: false });
 
   const yLog = useMemo(() => doc.getText(Y_TERM_LOG), [doc]);
 
@@ -66,14 +92,15 @@ export default function TerminalPanel({ activePath }: Props) {
   const mayRun = (path: string) =>
     status === "connected" && (isHost || (terminalPolicy.allowGuestInput && canEditDoc(path)));
 
-  const mayRunRef = useRef(mayRun);
-  mayRunRef.current = mayRun;
+  const name = me.name.replace(/[\x00-\x1f\x7f]/g, "");
+  const prompt = { text: `${ANSI.green}${name}${ANSI.reset}$ `, width: name.length + 2 };
 
   // Batched appends to the shared log (one Yjs update per flush, not per line).
   const pendingRef = useRef("");
   const flushTimerRef = useRef<number | null>(null);
 
   function flushLog() {
+    if (flushTimerRef.current != null) window.clearTimeout(flushTimerRef.current);
     flushTimerRef.current = null;
     const chunk = pendingRef.current;
     pendingRef.current = "";
@@ -98,22 +125,26 @@ export default function TerminalPanel({ activePath }: Props) {
     return out;
   }
 
-  async function run(path: string) {
-    const p = normalizePath(path);
-    if (!p || !isRunnable(p) || !mayRunRef.current(p) || runRef.current) return;
-
+  async function runProgram(path: string, commandLine: string) {
+    const line = lineRef.current;
+    const screen = screenRef.current;
     const files = collectFiles();
-    if (!(p in files)) return;
+    if (!(path in files)) {
+      screen?.print(`${ANSI.red}${commandLine.split(" ")[0]}: ${path}: No such file${ANSI.reset}\n`);
+      return;
+    }
 
-    const started = performance.now();
-    setRunning(p);
-    appendLog(`${ANSI.cyan}▶ ${me.name} ran ${p}${ANSI.reset}\n`);
+    // From here the typed line belongs to the program, and the command line
+    // is shared so everyone sees who ran what.
+    line.running = true;
+    screen?.redraw();
+    appendLog(`${prompt.text}${commandLine}\n`);
+    flushLog();
+    setRunning(path);
 
-    const colour = (stream: OutputStream) =>
-      stream === "stderr" ? ANSI.red : stream === "info" ? ANSI.dim : "";
-
+    const colour = (stream: OutputStream) => (stream === "stderr" ? ANSI.red : stream === "info" ? ANSI.dim : "");
     const handle = runInBrowser({
-      path: p,
+      path,
       files,
       onOutput: (text, stream) => {
         const c = colour(stream);
@@ -121,27 +152,140 @@ export default function TerminalPanel({ activePath }: Props) {
       },
     });
     runRef.current = handle;
+    await handle.done;
 
-    const ok = await handle.done;
-    const secs = ((performance.now() - started) / 1000).toFixed(1);
-    appendLog(
-      ok
-        ? `${ANSI.green}✔ finished in ${secs}s${ANSI.reset}\n\n`
-        : `${ANSI.yellow}✖ ended with an error after ${secs}s${ANSI.reset}\n\n`
-    );
+    // Start the next prompt on a fresh line, like a shell.
+    // (Coloured output ends with a reset code after its newline.)
+    const tail = (pendingRef.current || yLog.toString().slice(-16)).replace(/(\x1b\[[0-9;]*m)+$/, "");
+    if (tail && !tail.endsWith("\n")) appendLog("\n");
+    flushLog();
+
     runRef.current = null;
+    line.running = false;
+    line.input = "";
     setRunning(null);
+    screen?.redraw();
   }
+
+  function execute(commandLine: string) {
+    const screen = screenRef.current;
+    if (!screen) return;
+    const echo = `${prompt.text}${commandLine}\n`;
+    const cmd = parseCommand(commandLine);
+
+    switch (cmd.kind) {
+      case "none":
+        screen.print(echo);
+        return;
+      case "error":
+        screen.print(`${echo}${cmd.message}\n`);
+        return;
+      case "help":
+        screen.print(`${echo}${HELP_TEXT}\n`);
+        return;
+      case "clear":
+        screen.clear();
+        return;
+      case "ls": {
+        const files = [...getFilesMap(doc).keys()].filter((p) => canViewDoc(p));
+        const dirs = [...getDirsMap(doc).keys()].filter((p) => canViewDoc(p));
+        const names = listDir(files, dirs, cmd.path);
+        screen.print(
+          echo +
+            (names === null
+              ? `ls: ${cmd.path}: No such file or directory\n`
+              : names.length
+                ? names.join("  ") + "\n"
+                : "")
+        );
+        return;
+      }
+      case "cat": {
+        const text = canViewDoc(cmd.path) ? getFilesMap(doc).get(cmd.path)?.toString() : undefined;
+        if (text === undefined) {
+          screen.print(`${echo}cat: ${cmd.path}: No such file\n`);
+        } else {
+          screen.print(echo + text + (text && !text.endsWith("\n") ? "\n" : ""));
+        }
+        return;
+      }
+      case "run": {
+        if (!mayRun(cmd.path)) {
+          const why =
+            status !== "connected"
+              ? "not connected to the room"
+              : !isHost && !terminalPolicy.allowGuestInput
+                ? "the host has turned off running code for guests"
+                : "you need edit access to run this file";
+          screen.print(`${echo}${ANSI.red}permission denied: ${why}${ANSI.reset}\n`);
+          return;
+        }
+        void runProgram(cmd.path, commandLine);
+      }
+    }
+  }
+
+  function onEnter() {
+    const line = lineRef.current;
+    const text = line.input;
+    line.input = "";
+
+    if (line.running) {
+      // Typed input for the program: share the echo, then hand it over.
+      screenRef.current?.redraw();
+      appendLog(text + "\n");
+      flushLog();
+      runRef.current?.sendInput(text);
+      return;
+    }
+
+    if (text.trim() && line.history[line.history.length - 1] !== text) line.history.push(text);
+    line.historyIndex = line.history.length;
+    execute(text.trim());
+  }
+
+  function onCtrlC() {
+    const line = lineRef.current;
+    if (line.running) {
+      line.input = "";
+      runRef.current?.stop();
+      return;
+    }
+    const typed = line.input;
+    line.input = "";
+    screenRef.current?.print(`${prompt.text}${typed}^C\n`);
+  }
+
+  function onHistory(step: number) {
+    const line = lineRef.current;
+    if (line.running || !line.history.length) return;
+    line.historyIndex = Math.max(0, Math.min(line.history.length, line.historyIndex + step));
+    line.input = line.history[line.historyIndex] ?? "";
+    screenRef.current?.redraw();
+  }
+
+  /** Runs a file as if its command had been typed (Run button / Ctrl+Enter). */
+  function runFile(path: string) {
+    const line = lineRef.current;
+    if (line.running || !isRunnable(path)) return;
+    line.input = "";
+    execute(commandFor(path));
+    screenRef.current?.focus();
+  }
+
+  // Handlers registered once (xterm, window events) call the latest versions,
+  // so they see current permissions and files, not those from the first render.
+  const actionsRef = useRef({ onEnter, onCtrlC, onHistory, runFile, prompt });
+  actionsRef.current = { onEnter, onCtrlC, onHistory, runFile, prompt };
 
   // Run requests from the editor (Run button / Ctrl+Enter).
   useEffect(() => {
     const onRun = (e: Event) => {
       const path = (e as CustomEvent<{ path: string }>).detail?.path;
-      if (path) void run(path);
+      if (path) actionsRef.current.runFile(path);
     };
     window.addEventListener(RUN_EVENT, onRun);
     return () => window.removeEventListener(RUN_EVENT, onRun);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc]);
 
   // Stop any in-flight run when leaving the room.
@@ -152,41 +296,75 @@ export default function TerminalPanel({ activePath }: Props) {
     };
   }, [doc]);
 
-  // xterm mirrors the shared log.
+  // xterm shows the shared log, then the line being typed.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
     const term = new Terminal({
       convertEol: true,
-      disableStdin: true,
       fontSize: 13,
       scrollback: 8000,
-      cursorBlink: false,
+      cursorBlink: true,
       theme: { background: "#0b0f14", foreground: "#e5e7eb" },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
-    termRef.current = term;
     requestAnimationFrame(() => fit.fit());
 
     const ro = new ResizeObserver(() => fit.fit());
     ro.observe(container);
 
+    // Where this user's screen starts in the log (moved by `clear`).
+    let viewStart: Y.RelativePosition | null = null;
     let renderedLen = 0;
     let showingHint = false;
+    // Columns taken by the typed line currently on screen.
+    let drawnWidth = 0;
+
+    const line = lineRef.current;
+    const erase = () => {
+      const seq = drawnWidth ? "\b".repeat(drawnWidth) + "\x1b[J" : "";
+      drawnWidth = 0;
+      return seq;
+    };
+    const draw = () => {
+      const { prompt } = actionsRef.current;
+      const chars = Array.from(line.input).length;
+      if (line.running) {
+        drawnWidth = chars;
+        return line.input;
+      }
+      drawnWidth = prompt.width + chars;
+      return prompt.text + line.input;
+    };
+
     const renderAll = () => {
       term.reset();
-      const txt = yLog.toString();
+      term.write(REVERSE_WRAPAROUND);
+      const start = viewStart ? (Y.createAbsolutePositionFromRelativePosition(viewStart, doc)?.index ?? 0) : 0;
+      const txt = yLog.toString().slice(start);
       if (txt) term.write(txt);
-      else term.writeln(`${ANSI.dim}Output from Run appears here for everyone in the room.${ANSI.reset}`);
-      renderedLen = txt.length;
+      else term.writeln(`${ANSI.dim}Shared terminal. Type help for commands.${ANSI.reset}`);
+      renderedLen = yLog.length;
       showingHint = !txt;
+      drawnWidth = 0;
+      term.write(draw());
     };
     renderAll();
 
-    // Plain appends are streamed; anything else (clear, trimming) re-renders.
+    screenRef.current = {
+      redraw: () => term.write(erase() + draw()),
+      print: (text) => term.write(erase() + text + draw()),
+      clear: () => {
+        viewStart = Y.createRelativePositionFromTypeIndex(yLog, yLog.length);
+        renderAll();
+      },
+      focus: () => term.focus(),
+    };
+
+    // Plain appends are streamed; anything else (host clear, trimming) re-renders.
     const onLogChange = (ev: Y.YTextEvent) => {
       const d = ev.delta;
       const retain = d[0]?.retain ?? 0;
@@ -198,7 +376,7 @@ export default function TerminalPanel({ activePath }: Props) {
         d.length === (retain ? 2 : 1) &&
         retain === renderedLen;
       if (isAppend) {
-        term.write(String(ins!.insert));
+        term.write(erase() + String(ins!.insert) + draw());
         renderedLen = yLog.length;
       } else {
         renderAll();
@@ -206,7 +384,37 @@ export default function TerminalPanel({ activePath }: Props) {
     };
     yLog.observe(onLogChange);
 
-    // Copy with Ctrl+Shift+C
+    const onData = term.onData((data) => {
+      const actions = actionsRef.current;
+      if (data === "\x1b[A") return actions.onHistory(-1);
+      if (data === "\x1b[B") return actions.onHistory(1);
+      if (data.startsWith("\x1b")) return; // other keys (arrows, F-keys) aren't supported
+
+      let typed = "";
+      const flushTyped = () => {
+        if (!typed) return;
+        line.input += typed;
+        typed = "";
+        screenRef.current?.redraw();
+      };
+      for (const ch of data) {
+        if (ch >= " " && ch !== "\x7f") {
+          typed += ch;
+          continue;
+        }
+        flushTyped();
+        if (ch === "\r") actions.onEnter();
+        else if (ch === "\x7f" || ch === "\b") {
+          line.input = Array.from(line.input).slice(0, -1).join("");
+          screenRef.current?.redraw();
+        } else if (ch === "\x03") actions.onCtrlC();
+        else if (ch === "\x0c") screenRef.current?.clear();
+        else if (ch === "\t") typed += "    ";
+      }
+      flushTyped();
+    });
+
+    // Copy with Ctrl+Shift+C (Ctrl+C stops the program).
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type === "keydown" && (ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.code === "KeyC") {
         const sel = term.getSelection();
@@ -218,11 +426,12 @@ export default function TerminalPanel({ activePath }: Props) {
 
     return () => {
       yLog.unobserve(onLogChange);
+      onData.dispose();
       ro.disconnect();
+      screenRef.current = null;
       term.dispose();
-      termRef.current = null;
     };
-  }, [yLog]);
+  }, [yLog, doc]);
 
   function clearShared() {
     if (!isHost) return;
@@ -242,16 +451,12 @@ export default function TerminalPanel({ activePath }: Props) {
   const alreadyRequested = terminalRequests.some((r) => r.userId === me.userId);
 
   const statusText = running
-    ? `running ${running}…`
-    : !activePath
-      ? "open a .py, .js or .html file to run it"
-      : !activeRunnable
-        ? "this file type can't be run in the browser"
-        : canRunActive
-          ? "ready"
-          : blockedByPolicy
-            ? "the host has turned off running code for guests"
-            : "you need edit access to run this file";
+    ? `running ${running} (Ctrl+C to stop)`
+    : !activePath || !activeRunnable || canRunActive
+      ? "type help for commands"
+      : blockedByPolicy
+        ? "the host has turned off running code for guests"
+        : "you need edit access to run this file";
 
   return (
     <div style={{ height: "100%", width: "100%", display: "flex", flexDirection: "column" }}>
@@ -268,17 +473,17 @@ export default function TerminalPanel({ activePath }: Props) {
           flexWrap: "wrap",
         }}
       >
-        <div style={{ fontWeight: 600 }}>Output</div>
+        <div style={{ fontWeight: 600 }}>Terminal</div>
         <div style={{ fontSize: 12, opacity: 0.75, flex: "1 1 160px", minWidth: 0 }}>{statusText}</div>
 
         {running ? (
-          <button onClick={() => runRef.current?.stop()} style={toolbarBtn(true)}>
+          <button onClick={() => actionsRef.current.onCtrlC()} style={toolbarBtn(true)}>
             ■ Stop
           </button>
         ) : (
           <button
             disabled={!canRunActive}
-            onClick={() => activePath && void run(activePath)}
+            onClick={() => activePath && runFile(activePath)}
             style={toolbarBtn(canRunActive)}
             title="Run the open file (Ctrl+Enter in the editor)"
           >
@@ -314,7 +519,7 @@ export default function TerminalPanel({ activePath }: Props) {
         )}
 
         {isHost && (
-          <button onClick={clearShared} style={toolbarBtn(true)}>
+          <button onClick={clearShared} style={toolbarBtn(true)} title="Clear the terminal for everyone">
             Clear
           </button>
         )}

@@ -889,7 +889,7 @@ function AppShell({
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
           <div style={{ fontSize: 12, opacity: 0.75 }}>{user?.email}</div>
           <button onClick={() => setShowTerminal((v) => !v)} style={smallBtn}>
-            {showTerminal ? "Hide Output" : "Show Output"}
+            {showTerminal ? "Hide Terminal" : "Show Terminal"}
           </button>
           {tabBtn("chat", "Chat")}
           {tabBtn("people", "People")}

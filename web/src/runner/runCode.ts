@@ -7,6 +7,8 @@ export type RunHandle = {
   /** Resolves true on success, false on error/timeout/stop. */
   done: Promise<boolean>;
   stop: () => void;
+  /** Sends a line typed in the terminal to the program (input()). */
+  sendInput: (line: string) => void;
 };
 
 type Options = {
@@ -76,9 +78,15 @@ function runInWorker(
 
   worker.addEventListener("message", onMessage);
   worker.addEventListener("error", onError);
-  worker.postMessage({ id, ...payload });
+  worker.postMessage({ type: "run", id, ...payload });
 
-  return { done, stop: () => kill("\nStopped.\n") };
+  return {
+    done,
+    stop: () => kill("^C\n"),
+    sendInput: (line) => {
+      if (!finished) worker.postMessage({ type: "stdin", id, line });
+    },
+  };
 }
 
 /**
@@ -117,7 +125,7 @@ function previewHtml(path: string, files: Record<string, string>, onOutput: Opti
   const tab = window.open("", "_blank");
   if (!tab) {
     onOutput("Pop-up blocked: allow pop-ups for this site to open HTML previews.\n", "stderr");
-    return { done: Promise.resolve(false), stop: () => {} };
+    return { done: Promise.resolve(false), stop: () => {}, sendInput: () => {} };
   }
   tab.opener = null;
   const srcdoc = inlineHtml(path, files).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
@@ -129,7 +137,7 @@ function previewHtml(path: string, files: Record<string, string>, onOutput: Opti
   );
   tab.document.close();
   onOutput(`Opened preview of ${path} in a new tab.\n`, "info");
-  return { done: Promise.resolve(true), stop: () => {} };
+  return { done: Promise.resolve(true), stop: () => {}, sendInput: () => {} };
 }
 
 export function runInBrowser({ path, files, onOutput, timeoutMs = DEFAULT_TIMEOUT_MS }: Options): RunHandle {
@@ -168,5 +176,5 @@ export function runInBrowser({ path, files, onOutput, timeoutMs = DEFAULT_TIMEOU
   if (runtime === "html") return previewHtml(entry, files, onOutput);
 
   onOutput(`Don't know how to run ${entry}. Supported: .py, .js, .mjs, .html\n`, "stderr");
-  return { done: Promise.resolve(false), stop: () => {} };
+  return { done: Promise.resolve(false), stop: () => {}, sendInput: () => {} };
 }

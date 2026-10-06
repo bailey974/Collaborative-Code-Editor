@@ -347,6 +347,11 @@ export default function CodeEditor({ filePath }: Props) {
 
   const bindingRef = useRef<MonacoBinding | null>(null);
 
+  // Monaco mounts asynchronously, after the effects below first run. Bumped in
+  // onMount so they run again once the editor exists (otherwise the first file
+  // opened is never bound to the shared doc).
+  const [editorMounts, setEditorMounts] = useState(0);
+
   useEffect(() => {
     return () => {
       const ed = editorRef.current as any;
@@ -479,7 +484,7 @@ export default function CodeEditor({ filePath }: Props) {
     }
 
     editor.updateOptions({ readOnly: !canEdit });
-  }, [filePath, language, canView, canEdit]);
+  }, [filePath, language, canView, canEdit, editorMounts]);
 
   useEffect(() => {
     if (!filePath) setErr(null);
@@ -531,7 +536,7 @@ export default function CodeEditor({ filePath }: Props) {
       bindingRef.current?.destroy();
       bindingRef.current = null;
     };
-  }, [doc, awareness, filePath, canView, canEdit]);
+  }, [doc, awareness, filePath, canView, canEdit, editorMounts]);
 
   const headerRight = (
     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -726,6 +731,8 @@ export default function CodeEditor({ filePath }: Props) {
 
               // cleanup cursor tracker on unmount
               (editorRef.current as any).__cursorDisp = disp;
+
+              setEditorMounts((n) => n + 1);
             }}
             options={{
               automaticLayout: true,

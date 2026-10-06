@@ -28,6 +28,7 @@ Client (`cd web`):
 - `npm run dev`: Vite dev server on http://127.0.0.1:1420 (proxies `/api` and `/parties` to the Worker on :8787)
 - `npm run build`: typecheck + Vite build into `web/dist/` (the static site the Worker serves)
 - `npm run typecheck`: `tsc --noEmit`
+- `npm test`: Vitest unit tests (e.g. `src/runner/shell.test.ts`)
 
 Server (`cd server`, Cloudflare Worker via Wrangler):
 - `npm install`
@@ -46,7 +47,7 @@ One origin serves everything: the Worker hosts the built site (`web/dist`), the 
 - **Real-time state:** a single `Y.Doc` per room lives in a **Durable Object** (`server/src/room.ts`, built on `y-partyserver`), which syncs it to every client and persists it to the DO's own SQLite storage. The doc holds file contents, room metadata, roles, visibility rules, per-doc permissions, edit and terminal requests, terminal policy and chat. Presence and cursors use awareness (`presenceStyles.ts`). Y.Doc key names are shared between `web/src/collab/CollabProvider.tsx` and `server/src/room.ts` — keep them in sync.
 - **Collaboration auth:** the client opens `wss://<origin>/parties/room/<roomId>?token=<jwt>`. `authorizeSocket` in `index.ts` verifies the JWT **and** D1 room membership before the socket reaches the DO, strips any client-sent `x-collab-*` headers and injects trusted identity headers. The DO reverts host-only state from a trusted snapshot if a non-host touches it. (Verified: member→101, missing/bad token→401, non-member→403.)
 - **Files:** per-room, stored in the Y.Doc (no host filesystem access). FileExplorer reads/writes through the shared doc.
-- **Code runner (replaces the desktop PTY):** `web/src/runner/` runs the active file in the browser — JavaScript in a Web Worker, Python via Pyodide (CPython on WebAssembly, loaded from the jsDelivr CDN on first run). No server shell is ever spawned.
+- **Code runner (replaces the desktop PTY):** `web/src/runner/` backs a shared terminal (`TerminalPanel.tsx`): a small shell (`shell.ts`: `python`/`node`/`run <file>`, `ls`, `cat`, `clear`, `help`) runs files in the browser of whoever types the command — JavaScript in a Web Worker, Python via Pyodide (CPython on WebAssembly, loaded from the jsDelivr CDN on first run). Programs can read typed lines (`input()` in Python via Pyodide `run_sync`/JSPI, so Chrome/Edge only; `await input()` in JS). Program runs are shared through the `terminal:log` Y.Text; ls/cat/help output is local. No server shell is ever spawned.
 
 ### Environment / config
 Client (`web/`, all `VITE_*` are public in the bundle — no secrets): same-origin by default. `VITE_API_BASE_URL` and `VITE_COLLAB_URL` override the API and collaboration origins (mainly to point at a Worker on another host).
